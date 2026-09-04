@@ -1,0 +1,49 @@
+# =============================================================================
+#  00-server-common.cli
+#
+#  front / back に共通のサーバ設定。すべて if で冪等化してある。
+#
+#  ★ トレース観点での要点
+#
+#  (1) アクセスログに trace_id を出す
+#      X-Ray の 1 トレースと awslogs 上の 1 行を突き合わせられるようにする。
+#      Undertow のアクセスログは %{i,ヘッダ名} で受信ヘッダを出せるので、
+#      X-Amzn-Trace-Id と W3C traceparent の両方を出しておく。
+#      「X-Ray にトレースが無い」ときに、そもそもヘッダが来ていないのか、
+#      来ているのに送信できていないのかがログだけで切り分けられる。
+#
+#  (2) proxy-address-forwarding
+#      ALB 経由なので、これが無いと http.client_ip が ALB の IP になり、
+#      X-Ray 上でどのクライアントからの通信か分からなくなる。
+#
+#  (3) HTTP ポートを式にする
+#      front=8080 / back=18080 をイメージ共通のまま環境変数で切り替える。
+# =============================================================================
+
+# --- HTTP ポートを環境変数で切り替え可能にする -------------------------------
+/socket-binding-group=standard-sockets/socket-binding=http:write-attribute( \
+    name=port, value="${jboss.http.port:8080}")
+
+# --- ALB 配下で実クライアント IP を復元する ----------------------------------
+/subsystem=undertow/server=default-server/http-listener=default:write-attribute( \
+    name=proxy-address-forwarding, value=true)
+
+# --- ヘッダサイズ: X-Amzn-Trace-Id / traceparent / tracestate のぶん余裕を持たせる
+/subsystem=undertow/server=default-server/http-listener=default:write-attribute( \
+    name=max-header-size, value=${env.HTTP_MAX_HEADER_SIZE:16384})
+
+# --- アクセスログ (JSON 1 行 / trace 相関つき) --------------------------------
+#  awslogs へそのまま流れるよう標準出力へ出す。
+if (outcome != success) of /subsystem=undertow/server=default-server/host=default-host/setting=access-log:read-resource
+    echo "[cli] アクセスログ (trace 相関つき) を有効化します"
+    /subsystem=undertow/server=default-server/host=default-host/setting=access-log:add( \
+        pattern="{\"time\":\"%{time,yyyy-MM-dd'T'HH:mm:ss.SSSZ}\",\"remote\":\"%a\",\"method\":\"%m\",\"path\":\"%U%q\",\"status\":%s,\"bytes\":%b,\"took_ms\":%D,\"xray\":\"%{i,X-Amzn-Trace-Id}\",\"traceparent\":\"%{i,traceparent}\",\"caller\":\"%{i,X-App-Caller}\"}", \
+        use-server-log=true)
+end-if
+
+# --- 管理インターフェイスはループバック限定のまま (entrypoint の -bmanagement) -
+#     ECS Exec で入って調べる用途のみ。ALB からは到達させない。
+
+# --- 統計を有効化 -------------------------------------------------------------
+#     Undertow / データソースの統計。X-Ray と突き合わせる際の裏取りに使う。
+/subsystem=undertow:write-attribute(name=statistics-enabled, value=${env.EAP_STATISTICS_ENABLED:true})

@@ -1,0 +1,260 @@
+{
+  "_comment": [
+    "===========================================================================",
+    " ECS Fargate タスク定義テンプレート (front + back + ADOT サイドカー)",
+    "",
+    " scripts/gen-taskdefs.sh が __SERVICE__ 等を置換して",
+    " intra-api / intra-web / inter-api / sf-api の 4 本を生成する。",
+    "",
+    " ---------------------------------------------------------------------",
+    " トレースまわりの要点",
+    " ---------------------------------------------------------------------",
+    " 1. awsvpc モードではタスク内の全コンテナが 1 つのネットワーク名前空間を",
+    "    共有する。したがって",
+    "      front -> back           = http://localhost:18080",
+    "      front/back -> Collector = http://localhost:4317",
+    "      xray サンプラ -> awsproxy = http://localhost:2000",
+    "    となり、サイドカーのポートをタスク定義で公開する必要はない。",
+    "",
+    " 2. OTEL_* をここに書かない。与えるのは APP_SERVICE / APP_ROLE /",
+    "    APP_ENV / APP_NAMESPACE と接続先ホストだけ。OTEL_* は",
+    "    コンテナ内の base/bin/otel-env.sh が導出する。",
+    "    こうしておくと 4 サービス x 2 ロール x 4 環境 = 32 通りの",
+    "    タスク定義で命名がずれることが構造的に起きない。",
+    "",
+    " 3. taskRoleArn には X-Ray への書き込み権限が要る",
+    "      AWSXRayDaemonWriteAccess (PutTraceSegments / PutTelemetryRecords /",
+    "      GetSamplingRules / GetSamplingTargets / GetSamplingStatisticSummaries)",
+    "    GetSampling* は OTEL_TRACES_SAMPLER=xray (集中サンプリング) に必須。",
+    "    executionRoleArn ではなく taskRoleArn に付けること。",
+    "",
+    " 4. dependsOn で ADOT サイドカーを先に立ち上げる。START までしか",
+    "    保証されないので、起動直後のスパンも落としたくない場合は",
+    "    OTEL_WAIT_FOR_COLLECTOR=true を front/back に渡す。",
+    "",
+    " 5. Collector の設定は Secrets Manager から AOT_CONFIG_CONTENT に注入する",
+    "    (otel/collector-xray.yaml の内容をそのまま格納する)。",
+    "===========================================================================",
+    "",
+    "<...> の部分を環境に合わせて置換してから register-task-definition すること。"
+  ],
+
+  "family": "__SERVICE__-__ENV__",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "executionRoleArn": "arn:aws:iam::<account-id>:role/<ecs-task-execution-role>",
+  "taskRoleArn": "arn:aws:iam::<account-id>:role/<ecs-task-role-with-xray-write>",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+
+  "volumes": [
+    { "name": "front-run" },
+    { "name": "back-run" }
+  ],
+
+  "containerDefinitions": [
+    {
+      "name": "front",
+      "image": "<account-id>.dkr.ecr.<region>.amazonaws.com/__SERVICE__-front:<tag>",
+      "essential": true,
+      "user": "6301:6302",
+      "readonlyRootFilesystem": true,
+
+      "mountPoints": [
+        { "sourceVolume": "front-run", "containerPath": "/run/eap", "readOnly": false }
+      ],
+      "portMappings": [
+        { "containerPort": 8080, "protocol": "tcp" }
+      ],
+
+      "dependsOn": [
+        { "containerName": "adot-collector", "condition": "START" }
+      ],
+
+      "environment": [
+        { "_comment": "--- 命名規約の入力。これだけで service.name = __SERVICE__-front が決まる ---" },
+        { "name": "APP_SERVICE",   "value": "__SERVICE__" },
+        { "name": "APP_ROLE",      "value": "front" },
+        { "name": "APP_ENV",       "value": "__ENV__" },
+        { "name": "APP_NAMESPACE", "value": "__NAMESPACE__" },
+        { "name": "APP_VERSION",   "value": "<image-tag>" },
+
+        { "_comment": "--- ADOT サイドカーはタスク内 = localhost ---" },
+        { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://localhost:4317" },
+        { "name": "OTEL_EXPORTER_OTLP_PROTOCOL", "value": "grpc" },
+        { "name": "OTEL_WAIT_FOR_COLLECTOR",     "value": "true" },
+
+        { "_comment": "--- back も同一タスク内 = localhost ---" },
+        { "name": "BACKEND_HOST", "value": "localhost" },
+        { "name": "BACKEND_URL",  "value": "http://localhost:18080" },
+
+        { "_comment": "--- Aurora Serverless v2 (MySQL 8.4)。DB_HOST は peer.service のキーにもなる ---" },
+        { "name": "DB_HOST", "value": "<aurora-cluster>.cluster-<id>.<region>.rds.amazonaws.com" },
+        { "name": "DB_PORT", "value": "3306" },
+        { "name": "DB_NAME", "value": "<dbname>" },
+        { "name": "DB_USE_SSL", "value": "true" },
+
+        { "_comment": "--- ElastiCache for Valkey ---" },
+        { "name": "VALKEY_HOST", "value": "<valkey-cluster>.<id>.<region>.cache.amazonaws.com" },
+        { "name": "VALKEY_PORT", "value": "6379" },
+
+        { "_comment": "--- 帳票 EC2 (内部 ALB 経由) ---" },
+        { "name": "REPORT_ALB_HOST", "value": "<report-alb>.<region>.elb.amazonaws.com" },
+        { "name": "REPORT_ALB_URL",  "value": "https://<report-alb>.<region>.elb.amazonaws.com/report/daily" },
+
+        { "_comment": "--- 外部 SLB (VPC 外) ---" },
+        { "name": "EXTERNAL_SLB_HOST", "value": "<external-slb-fqdn>" },
+        { "name": "EXTERNAL_SLB_URL",  "value": "https://<external-slb-fqdn>/outside/api" },
+
+        { "_comment": "--- SQS。SQS_ENDPOINT は未設定 = 実 SQS を使う ---" },
+        { "name": "SQS_HOST",      "value": "sqs.<region>.amazonaws.com" },
+        { "name": "SQS_QUEUE_URL", "value": "https://sqs.<region>.amazonaws.com/<account-id>/<queue-name>" },
+        { "name": "AWS_REGION",    "value": "<region>" }
+      ],
+
+      "secrets": [
+        { "name": "DB_USER",     "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:<db-secret>:username::" },
+        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:<db-secret>:password::" }
+      ],
+
+      "healthCheck": {
+        "command": ["CMD", "/opt/app/bin/healthcheck.sh"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 180
+      },
+      "stopTimeout": 90,
+
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/__ENV__/__SERVICE__/front",
+          "awslogs-region": "<region>",
+          "awslogs-stream-prefix": "front",
+          "awslogs-create-group": "true"
+        }
+      }
+    },
+
+    {
+      "name": "back",
+      "image": "<account-id>.dkr.ecr.<region>.amazonaws.com/__SERVICE__-back:<tag>",
+      "essential": true,
+      "user": "6301:6302",
+      "readonlyRootFilesystem": true,
+
+      "mountPoints": [
+        { "sourceVolume": "back-run", "containerPath": "/run/eap", "readOnly": false }
+      ],
+      "portMappings": [
+        { "containerPort": 18080, "protocol": "tcp" }
+      ],
+
+      "dependsOn": [
+        { "containerName": "adot-collector", "condition": "START" }
+      ],
+
+      "environment": [
+        { "name": "APP_SERVICE",   "value": "__SERVICE__" },
+        { "name": "APP_ROLE",      "value": "back" },
+        { "name": "APP_ENV",       "value": "__ENV__" },
+        { "name": "APP_NAMESPACE", "value": "__NAMESPACE__" },
+        { "name": "APP_VERSION",   "value": "<image-tag>" },
+
+        { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://localhost:4317" },
+        { "name": "OTEL_EXPORTER_OTLP_PROTOCOL", "value": "grpc" },
+        { "name": "OTEL_WAIT_FOR_COLLECTOR",     "value": "true" },
+
+        { "name": "DB_HOST", "value": "<aurora-cluster>.cluster-<id>.<region>.rds.amazonaws.com" },
+        { "name": "DB_PORT", "value": "3306" },
+        { "name": "DB_NAME", "value": "<dbname>" },
+        { "name": "DB_USE_SSL", "value": "true" },
+        { "name": "DB_MAX_POOL", "value": "40" },
+
+        { "name": "VALKEY_HOST", "value": "<valkey-cluster>.<id>.<region>.cache.amazonaws.com" },
+        { "name": "VALKEY_PORT", "value": "6379" },
+
+        { "name": "AWS_REGION", "value": "<region>" }
+      ],
+
+      "secrets": [
+        { "name": "DB_USER",     "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:<db-secret>:username::" },
+        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:<db-secret>:password::" }
+      ],
+
+      "healthCheck": {
+        "command": ["CMD", "/opt/app/bin/healthcheck.sh"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 180
+      },
+      "stopTimeout": 90,
+
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/__ENV__/__SERVICE__/back",
+          "awslogs-region": "<region>",
+          "awslogs-stream-prefix": "back",
+          "awslogs-create-group": "true"
+        }
+      }
+    },
+
+    {
+      "_comment": [
+        "ADOT Collector サイドカー。",
+        "",
+        "設定は otel/collector-xray.yaml の内容を Secrets Manager に格納し、",
+        "AOT_CONFIG_CONTENT として注入する。command で env: を指定すると",
+        "Collector は環境変数の中身を設定ファイルとして読む。",
+        "",
+        "essential は false にしておく。Collector が落ちたときにアプリまで",
+        "巻き添えで停止すると、可観測性のためのコンポーネントがサービス断の",
+        "原因になってしまう。逆に Collector が落ちればトレースは欠けるので、",
+        "healthCheck とアラームで検知する。"
+      ],
+      "name": "adot-collector",
+      "image": "public.ecr.aws/aws-observability/aws-otel-collector:v0.43.3",
+      "essential": false,
+      "cpu": 256,
+      "memoryReservation": 512,
+
+      "command": ["--config=env:AOT_CONFIG_CONTENT"],
+
+      "environment": [
+        { "name": "AWS_REGION", "value": "<region>" }
+      ],
+      "secrets": [
+        {
+          "name": "AOT_CONFIG_CONTENT",
+          "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:<adot-collector-config-secret>"
+        }
+      ],
+
+      "healthCheck": {
+        "command": ["CMD", "/healthcheck"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/__ENV__/__SERVICE__/adot-collector",
+          "awslogs-region": "<region>",
+          "awslogs-stream-prefix": "adot",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

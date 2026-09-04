@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+#  front/Containerfile  — フロントコンテナ
+#
+#   ベースコンテナ (base/Containerfile) を継承し、front 固有の
+#     - WAR の配置 (archive 方式)
+#     - HTTP ポート (8080)
+#     - front 専用の JBoss CLI
+#     - APP_ROLE=front
+#   だけを足す。共通処理 (entrypoint / jvm-env / otel-env / ADOT Agent /
+#   データソース) はすべてベース側にある。
+#
+#   ビルド例:
+#     docker build -f front/Containerfile -t intra-api-front:1.0 \
+#       --build-arg BASE_IMAGE=app-eap-base:1.0 \
+#       --build-arg APP_SOURCE=dist/front.war .
+#
+#   ★ OTEL_SERVICE_NAME はここで焼かない。
+#     イメージは 4 サービス共通で、service.name は起動時に
+#     APP_SERVICE (タスク定義から) + APP_ROLE (=front) から導出される。
+#     焼き込むと intra-api 用 / sf-api 用にイメージが分裂する。
+# =============================================================================
+
+ARG BASE_IMAGE=app-eap-base:1.0
+
+FROM ${BASE_IMAGE} AS front
+
+ARG APP_DIR=/opt/app
+ARG APP_NAME=app.war
+# ビルドコンテキストにある front の WAR。実プロジェクトでは各チームの
+# ビルド成果物 (target/front.war など) を指す。
+ARG APP_SOURCE=dist/front.war
+ARG HTTP_PORT=8080
+ARG APP_UID=6301
+ARG APP_GID=6302
+
+USER root
+
+# -----------------------------------------------------------------------------
+#  1. WAR の配置 (archive 方式)
+#     standalone.xml の <fs-archive path="/opt/app/app.war"/> が指す実体。
+#     ディレクトリではなく単一ファイルであること (entrypoint.sh が検証する)。
+# -----------------------------------------------------------------------------
+COPY --chown=${APP_UID}:${APP_GID} ${APP_SOURCE} ${APP_DIR}/${APP_NAME}
+RUN chmod 0444 "${APP_DIR}/${APP_NAME}"
+
+# -----------------------------------------------------------------------------
+#  2. front 固有の JBoss CLI
+#
+#     - WAR を unmanaged deployment (fs-archive) として standalone.xml に焼く
+#     - front 固有のサブシステム設定 (セッション設定など)
+#
+#     ベース側の共通 CLI は適用済み。ここでは 5*.cli だけを追加適用する。
+# -----------------------------------------------------------------------------
+COPY front/cli/ ${APP_DIR}/cli/
+RUN set -eu; \
+    sed -i 's/\r$//' "${APP_DIR}"/cli/5*.cli; \
+    chmod 0444 "${APP_DIR}"/cli/5*.cli; \
+    /usr/local/bin/apply-cli.sh \
+        --eap-home "${JBOSS_HOME}" \
+        --config   "${EAP_CONFIG}" \
+        --cli-dir  "${APP_DIR}/cli" \
+        --pattern  '5*.cli'; \
+    rm -rf "${EAP_SEED_DIR}/configuration"; \
+    cp -a "${JBOSS_HOME}/standalone/configuration" "${EAP_SEED_DIR}/configuration"; \
+    chmod -R a+rX "${EAP_SEED_DIR}"; \
+    grep -q 'fs-archive' "${EAP_SEED_DIR}/configuration/${EAP_CONFIG}" \
+      || { echo "ERROR: standalone.xml に <fs-archive> が焼き込まれていません" >&2; exit 3; }; \
+    echo "[build][front] --- 焼き込まれた <deployments> ---"; \
+    sed -n '/<deployments>/,/<\/deployments>/p' "${EAP_SEED_DIR}/configuration/${EAP_CONFIG}"
+
+# -----------------------------------------------------------------------------
+#  3. front の実行時既定値
+#
+#     APP_SERVICE (intra-api / intra-web / inter-api / sf-api) は
+#     タスク定義 / compose から与える。ここでは決めない。
+# -----------------------------------------------------------------------------
+ENV APP_ROLE=front \
+    APP_NAME=${APP_NAME} \
+    APP_DEPLOY_PATH=${APP_DIR}/${APP_NAME} \
+    HTTP_PORT=${HTTP_PORT} \
+    JBOSS_HTTP_PORT=${HTTP_PORT} \
+    HEALTHCHECK_CONTEXT=/front \
+    HEALTHCHECK_PATH=/api/health
+
+LABEL org.opencontainers.image.title="eap81-adot-front" \
+      app.role="front"
+
+EXPOSE ${HTTP_PORT}
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=5 \
+    CMD /opt/app/bin/healthcheck.sh
+
+USER ${APP_UID}:${APP_GID}
+WORKDIR /run/eap
+
+# ENTRYPOINT / CMD はベースイメージから継承

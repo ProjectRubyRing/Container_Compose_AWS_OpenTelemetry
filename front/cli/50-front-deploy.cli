@@ -1,0 +1,64 @@
+# =============================================================================
+#  50-front-deploy.cli   (front 固有)
+#
+#  (1) WAR を unmanaged deployment (archive 方式) として standalone.xml に焼く
+#  (2) deployment-scanner を外す
+#  (3) front のポートを 8080 に固定
+#
+#  ★ なぜ deployments ディレクトリを使わないのか
+#    deployment-scanner は .deployed / .failed マーカーを $JBOSS_HOME 配下に
+#    書き込む。readonlyRootFilesystem=true では書けずデプロイに失敗する。
+#    <fs-archive> なら EAP はそのパスを「読むだけ」で配備するので、
+#    ルートを読み取り専用のまま archive 方式を維持できる。
+#
+#  ★ トレース観点
+#    デプロイ名 (runtime-name) は OpenTelemetry Java Agent の
+#    「アプリケーションサーバからの service.name 推測」の入力になる。
+#    本構成では OTEL_SERVICE_NAME を otel-env.sh が必ず明示するため
+#    推測は使われないが、万一 OTEL_SERVICE_NAME が抜けた場合は
+#    service.name が front / back になる。X-Ray 上で
+#    「intra-api-front であるべきノードが front になっている」と
+#    すぐ分かるので、静かに壊れずに済む。
+# =============================================================================
+
+# --- deployment-scanner を外す ------------------------------------------------
+if (outcome == success) of /subsystem=deployment-scanner/scanner=default:read-resource
+    echo "[cli][front] deployment-scanner を削除します (readonlyRootFilesystem 対応)"
+    /subsystem=deployment-scanner/scanner=default:remove
+end-if
+if (outcome == success) of /subsystem=deployment-scanner:read-resource
+    /subsystem=deployment-scanner:remove
+end-if
+if (outcome == success) of /extension=org.jboss.as.deployment-scanner:read-resource
+    /extension=org.jboss.as.deployment-scanner:remove
+end-if
+
+# --- WAR を unmanaged (fs-archive) で登録 -------------------------------------
+#
+#  ★ runtime-name を front.war にしてコンテキストルートを /front にする。
+#
+#    front と back は同じタスク内に居て、同じ ALB がパスベースで振り分ける。
+#    両方のコンテキストルートが /app だとパスで区別できず、ALB のルールを
+#    書けない (ALB はパスを書き換えずそのまま転送する)。
+#    ロールごとにコンテキストを分けておけば、ALB のルールは
+#        /front/* -> front のターゲットグループ
+#        /back/*  -> back  のターゲットグループ
+#    と素直に書ける。
+#
+#    content の path は front/back とも /opt/app/app.war のまま
+#    (実体のファイル名と、配備上の名前を分けている)。
+if (outcome != success) of /deployment=front.war:read-resource
+    echo "[cli][front] front.war (context=/front) を fs-archive で登録します"
+    /deployment=front.war:add( \
+        runtime-name=front.war, \
+        content=[{"path" => "/opt/app/app.war", "archive" => true}], \
+        enabled=true)
+end-if
+
+# --- front の HTTP ポート -----------------------------------------------------
+/socket-binding-group=standard-sockets/socket-binding=http:write-attribute( \
+    name=port, value="${jboss.http.port:8080}")
+
+# --- セッション ---------------------------------------------------------------
+#  front は画面を持つのでセッションを使う。back は使わない (60-back-*.cli 参照)。
+/subsystem=undertow/servlet-container=default/setting=websockets:read-resource

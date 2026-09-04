@@ -1,0 +1,87 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+#  back/Containerfile  — バックコンテナ
+#
+#   ベースコンテナ (base/Containerfile) を継承し、back 固有の
+#     - WAR の配置 (archive 方式)
+#     - HTTP ポート (18080 / front と同一タスク内で衝突させない)
+#     - back 専用の JBoss CLI (DB プールを厚めに / SQS 連携)
+#     - APP_ROLE=back
+#   だけを足す。
+#
+#   ★ ポートを分ける理由
+#     ECS の awsvpc モードではタスク内の全コンテナが同じネットワーク名前空間を
+#     共有する。front と back が同じ 8080 を listen すると後勝ちで起動失敗する。
+#     同時に、この「同一名前空間」のおかげで front -> back は
+#     http://localhost:18080 で届く。ADOT サイドカーへの localhost:4317 も同じ
+#     理屈。Compose ではここだけがサービス名解決に変わる。
+#
+#   ビルド例:
+#     docker build -f back/Containerfile -t intra-api-back:1.0 \
+#       --build-arg BASE_IMAGE=app-eap-base:1.0 \
+#       --build-arg APP_SOURCE=dist/back.war .
+# =============================================================================
+
+ARG BASE_IMAGE=app-eap-base:1.0
+
+FROM ${BASE_IMAGE} AS back
+
+ARG APP_DIR=/opt/app
+ARG APP_NAME=app.war
+ARG APP_SOURCE=dist/back.war
+ARG HTTP_PORT=18080
+ARG APP_UID=6301
+ARG APP_GID=6302
+
+USER root
+
+# -----------------------------------------------------------------------------
+#  1. WAR の配置 (archive 方式)
+# -----------------------------------------------------------------------------
+COPY --chown=${APP_UID}:${APP_GID} ${APP_SOURCE} ${APP_DIR}/${APP_NAME}
+RUN chmod 0444 "${APP_DIR}/${APP_NAME}"
+
+# -----------------------------------------------------------------------------
+#  2. back 固有の JBoss CLI
+# -----------------------------------------------------------------------------
+COPY back/cli/ ${APP_DIR}/cli/
+RUN set -eu; \
+    sed -i 's/\r$//' "${APP_DIR}"/cli/6*.cli; \
+    chmod 0444 "${APP_DIR}"/cli/6*.cli; \
+    /usr/local/bin/apply-cli.sh \
+        --eap-home "${JBOSS_HOME}" \
+        --config   "${EAP_CONFIG}" \
+        --cli-dir  "${APP_DIR}/cli" \
+        --pattern  '6*.cli'; \
+    rm -rf "${EAP_SEED_DIR}/configuration"; \
+    cp -a "${JBOSS_HOME}/standalone/configuration" "${EAP_SEED_DIR}/configuration"; \
+    chmod -R a+rX "${EAP_SEED_DIR}"; \
+    grep -q 'fs-archive' "${EAP_SEED_DIR}/configuration/${EAP_CONFIG}" \
+      || { echo "ERROR: standalone.xml に <fs-archive> が焼き込まれていません" >&2; exit 3; }; \
+    echo "[build][back] --- 焼き込まれた <deployments> ---"; \
+    sed -n '/<deployments>/,/<\/deployments>/p' "${EAP_SEED_DIR}/configuration/${EAP_CONFIG}"
+
+# -----------------------------------------------------------------------------
+#  3. back の実行時既定値
+# -----------------------------------------------------------------------------
+ENV APP_ROLE=back \
+    APP_NAME=${APP_NAME} \
+    APP_DEPLOY_PATH=${APP_DIR}/${APP_NAME} \
+    HTTP_PORT=${HTTP_PORT} \
+    JBOSS_HTTP_PORT=${HTTP_PORT} \
+    HEALTHCHECK_CONTEXT=/back \
+    HEALTHCHECK_PATH=/api/health \
+    DB_MAX_POOL=40
+
+LABEL org.opencontainers.image.title="eap81-adot-back" \
+      app.role="back"
+
+EXPOSE ${HTTP_PORT}
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=5 \
+    CMD /opt/app/bin/healthcheck.sh
+
+USER ${APP_UID}:${APP_GID}
+WORKDIR /run/eap
+
+# ENTRYPOINT / CMD はベースイメージから継承

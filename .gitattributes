@@ -1,0 +1,18 @@
+# コンテナ内で実行するシェル/CLI は必ず LF にする。
+# Windows でチェックアウトして CRLF になると、コンテナ内で
+#   /opt/app/bin/entrypoint.sh: cannot execute: required file not found
+# のような分かりにくいエラーになる (Containerfile 側でも sed で保険をかけている)。
+* text=auto eol=lf
+*.sh      text eol=lf
+*.cli     text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.py      text eol=lf
+*.java    text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+Containerfile text eol=lf
+Dockerfile    text eol=lf
+*.war     binary
+*.jar     binary
+*.zip     binary

@@ -1,0 +1,330 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+#  base/Containerfile  — front / back 共通のベースコンテナ
+#
+#    UBI 9.8
+#      + Red Hat build of OpenJDK 21
+#      + JBoss EAP 8.1 (jboss-cli.sh で構成)
+#      + ADOT Java Agent (aws-opentelemetry-agent.jar)
+#      + 共通シェル (entrypoint / jvm-env / otel-env)
+#
+#    WAR は archive 方式。front / back の Containerfile はこのイメージを
+#    FROM にして、それぞれの WAR と固有設定だけを足す。
+#
+#  ---------------------------------------------------------------------------
+#  ビルド例
+#  ---------------------------------------------------------------------------
+#    # 本番 (EAP 8.1 の zip を vendor/ に置いておく)
+#    docker build -f base/Containerfile -t app-eap-base:1.0 \
+#      --build-arg SERVER_SOURCE=zip \
+#      --build-arg EAP_ZIP=vendor/jboss-eap-8.1.0.zip .
+#
+#    # ローカル検証 (EAP zip が無い環境。WildFly を落としてくる)
+#    docker build -f base/Containerfile -t app-eap-base:1.0 \
+#      --build-arg SERVER_SOURCE=wildfly .
+#
+#    # 社内の EAP ランタイムイメージを土台にする
+#    docker build -f base/Containerfile -t app-eap-base:1.0 \
+#      --build-arg SERVER_SOURCE=image \
+#      --build-arg EAP_IMAGE=registry.redhat.io/jboss-eap-8/eap81-openjdk21-runtime-openshift-rhel9:latest \
+#      --build-arg EAP_HOME=/opt/server .
+#
+#  ビルドコンテキストはリポジトリルート (base/ ではない)。
+# =============================================================================
+
+ARG BASE_IMAGE=registry.access.redhat.com/ubi9/ubi:9.8
+
+#  zip     : BASE_IMAGE に EAP 8.1 の zip を展開する (本番)
+#  image   : 既に EAP が入っているイメージを土台にする
+#  wildfly : WildFly を取得する (EAP zip を持てないローカル検証用)
+ARG SERVER_SOURCE=zip
+ARG EAP_IMAGE=registry.access.redhat.com/ubi9/ubi:9.8
+
+
+# =============================================================================
+#  stage: server-zip — UBI 9.8 + OpenJDK 21 + EAP 8.1 (本番想定)
+#
+#   EAP 8.1 の zip は Red Hat のサブスクリプションが必要で公開ダウンロードは
+#   できないため、あらかじめビルドコンテキストへ置いておく前提。
+# =============================================================================
+FROM ${BASE_IMAGE} AS server-zip
+
+ARG EAP_HOME=/opt/eap
+ARG EAP_ZIP=vendor/jboss-eap-8.1.0.zip
+ARG EAP_ZIP_DIRNAME=jboss-eap-8.1
+
+# Red Hat build of OpenJDK 21 (headless)
+#   shadow-utils : useradd / groupadd
+#   util-linux   : setpriv (root 起動時の権限降格)
+#   unzip        : EAP zip の展開
+#   procps-ng    : 障害調査時の ps
+#   curl-minimal : ヘルスチェックと ADOT Agent の取得
+RUN dnf -y update \
+ && dnf -y install --setopt=install_weak_deps=False \
+        java-21-openjdk-headless \
+        shadow-utils util-linux unzip procps-ng curl-minimal \
+ && dnf clean all && rm -rf /var/cache/dnf
+
+ENV JAVA_HOME=/usr/lib/jvm/jre-21
+
+COPY ${EAP_ZIP} /tmp/eap.zip
+RUN set -eu; \
+    unzip -q /tmp/eap.zip -d /opt; \
+    if [ ! -d "/opt/${EAP_ZIP_DIRNAME}" ]; then \
+        echo "ERROR: /opt/${EAP_ZIP_DIRNAME} がありません。EAP_ZIP_DIRNAME を確認してください。" >&2; \
+        echo "       /opt の中身: $(ls /opt)" >&2; exit 2; \
+    fi; \
+    [ "/opt/${EAP_ZIP_DIRNAME}" = "${EAP_HOME}" ] || mv "/opt/${EAP_ZIP_DIRNAME}" "${EAP_HOME}"; \
+    rm -f /tmp/eap.zip; \
+    chmod 0755 "${EAP_HOME}/bin/"*.sh
+
+ENV JBOSS_HOME=${EAP_HOME}
+
+
+# =============================================================================
+#  stage: server-image — 既に EAP が入っているイメージを土台にする
+# =============================================================================
+FROM ${EAP_IMAGE} AS server-image
+
+
+# =============================================================================
+#  stage: server-wildfly — ローカル検証用 (EAP zip を持てない環境)
+#
+#   EAP 8.1 は WildFly 35 系をベースにしている。CLI / entrypoint / OTel 設定は
+#   そのまま通るので、Compose での疎通確認はこちらで十分に行える。
+#   ★ 本番イメージには使わないこと。
+# =============================================================================
+FROM ${BASE_IMAGE} AS server-wildfly
+
+ARG EAP_HOME=/opt/eap
+ARG WILDFLY_VERSION=35.0.1.Final
+
+RUN dnf -y update \
+ && dnf -y install --setopt=install_weak_deps=False \
+        java-21-openjdk-headless \
+        shadow-utils util-linux tar gzip procps-ng curl-minimal \
+ && dnf clean all && rm -rf /var/cache/dnf
+
+ENV JAVA_HOME=/usr/lib/jvm/jre-21
+
+RUN set -eu; \
+    curl -fsSL -o /tmp/wildfly.tar.gz \
+      "https://github.com/wildfly/wildfly/releases/download/${WILDFLY_VERSION}/wildfly-${WILDFLY_VERSION}.tar.gz"; \
+    mkdir -p /opt; \
+    tar -xzf /tmp/wildfly.tar.gz -C /opt; \
+    mv "/opt/wildfly-${WILDFLY_VERSION}" "${EAP_HOME}"; \
+    rm -f /tmp/wildfly.tar.gz; \
+    chmod 0755 "${EAP_HOME}/bin/"*.sh
+
+ENV JBOSS_HOME=${EAP_HOME}
+
+
+# =============================================================================
+#  stage: base — 実際に front / back が FROM に指定するイメージ
+# =============================================================================
+FROM server-${SERVER_SOURCE} AS base
+
+ARG EAP_HOME=/opt/eap
+ARG EAP_RUN_DIR=/run/eap
+ARG EAP_SEED_DIR=/opt/eap-seed
+ARG EAP_CONFIG=standalone.xml
+ARG APP_DIR=/opt/app
+ARG APP_BIN_DIR=/opt/app/bin
+
+# --- ADOT Java Agent -----------------------------------------------------------
+#  ★ OpenTelemetry 標準の opentelemetry-javaagent.jar ではなく、AWS Distro の
+#    aws-opentelemetry-agent.jar を使う。両者の決定的な違い:
+#
+#      1. トレース ID の採番方式
+#         X-Ray はトレース ID の先頭 4 バイトを「UNIX epoch 秒」として解釈し、
+#         現在時刻から大きく外れた ID のセグメントを InvalidTraceId で捨てる。
+#         標準エージェントは W3C 準拠の完全ランダム 128bit を採番するため、
+#         X-Ray へ送ると大半が捨てられる (Collector のログにだけエラーが出て、
+#         コンソールには何も出ないので極めて気づきにくい)。
+#         ADOT エージェントは X-Ray 互換の ID ジェネレータを既定で組み込む。
+#
+#      2. X-Ray propagator / サンプラの同梱
+#         xray propagator と X-Ray 集中サンプリング (OTEL_TRACES_SAMPLER=xray)
+#         が最初から入っている。標準エージェントには含まれない。
+#
+#    Jaeger しか使わないなら標準エージェントでも動くが、同じイメージを
+#    Compose と ECS の両方で使う以上、ADOT に一本化する。
+ARG ADOT_JAVA_AGENT_VERSION=2.11.0
+ARG ADOT_AGENT_DIR=/opt/aws
+ARG ADOT_AGENT_PATH=/opt/aws/aws-opentelemetry-agent.jar
+
+# --- MySQL Connector/J (Aurora MySQL 8.4 互換) ---------------------------------
+ARG MYSQL_CONNECTOR_VERSION=9.1.0
+
+# --- 実行ユーザ -----------------------------------------------------------------
+ARG APP_UID=6301
+ARG APP_GID=6302
+ARG APP_USER=appuser
+ARG APP_GROUP=appgroup
+
+USER root
+
+# -----------------------------------------------------------------------------
+#  0. 前提の検証
+# -----------------------------------------------------------------------------
+RUN set -eu; \
+    if [ ! -x "${EAP_HOME}/bin/standalone.sh" ]; then \
+        echo "ERROR: ${EAP_HOME}/bin/standalone.sh が見つかりません。" >&2; \
+        echo "       SERVER_SOURCE=image のときは --build-arg EAP_HOME=<そのイメージの JBOSS_HOME> を渡してください。" >&2; \
+        echo "       このイメージの JBOSS_HOME: '${JBOSS_HOME:-未設定}'" >&2; exit 2; \
+    fi; \
+    echo "[build] EAP_HOME=${EAP_HOME}"
+
+# -----------------------------------------------------------------------------
+#  1. 実行ユーザ
+# -----------------------------------------------------------------------------
+RUN set -eu; \
+    if command -v groupadd >/dev/null 2>&1 && command -v useradd >/dev/null 2>&1; then \
+        getent group  "${APP_GID}" >/dev/null 2>&1 || groupadd -g "${APP_GID}" "${APP_GROUP}"; \
+        getent passwd "${APP_UID}" >/dev/null 2>&1 || \
+            useradd -u "${APP_UID}" -g "${APP_GID}" -M -d "/home/${APP_USER}" -s /sbin/nologin "${APP_USER}"; \
+    else \
+        echo "[build] NOTE: shadow-utils が無いため数値 uid/gid のみで実行します"; \
+    fi
+
+# -----------------------------------------------------------------------------
+#  2. ADOT Java Agent
+#
+#     ネットワーク隔離されたビルド環境では、事前に vendor/ へ置いたものを
+#     --build-arg ADOT_AGENT_LOCAL=vendor/aws-opentelemetry-agent.jar で使える。
+# -----------------------------------------------------------------------------
+RUN set -eu; \
+    mkdir -p "${ADOT_AGENT_DIR}"; \
+    curl -fsSL -o "${ADOT_AGENT_PATH}" \
+      "https://github.com/aws-observability/aws-otel-java-instrumentation/releases/download/v${ADOT_JAVA_AGENT_VERSION}/aws-opentelemetry-agent.jar"; \
+    chmod 0444 "${ADOT_AGENT_PATH}"; \
+    echo "[build] ADOT Java Agent: $(wc -c < "${ADOT_AGENT_PATH}") bytes (v${ADOT_JAVA_AGENT_VERSION})"
+
+# -----------------------------------------------------------------------------
+#  3. MySQL Connector/J を JBoss モジュールとして登録
+#     (20-datasource-aurora.cli の driver-module-name=com.mysql が参照する)
+# -----------------------------------------------------------------------------
+RUN set -eu; \
+    MOD_DIR="${EAP_HOME}/modules/system/layers/base/com/mysql/main"; \
+    mkdir -p "${MOD_DIR}"; \
+    curl -fsSL -o "${MOD_DIR}/mysql-connector-j.jar" \
+      "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/${MYSQL_CONNECTOR_VERSION}/mysql-connector-j-${MYSQL_CONNECTOR_VERSION}.jar"; \
+    printf '%s\n' \
+      '<?xml version="1.0" encoding="UTF-8"?>' \
+      '<module xmlns="urn:jboss:module:1.9" name="com.mysql">' \
+      '  <resources>' \
+      '    <resource-root path="mysql-connector-j.jar"/>' \
+      '  </resources>' \
+      '  <dependencies>' \
+      '    <module name="java.se"/>' \
+      '    <module name="jakarta.transaction.api"/>' \
+      '  </dependencies>' \
+      '</module>' \
+      > "${MOD_DIR}/module.xml"
+
+# -----------------------------------------------------------------------------
+#  4. 共通シェルと CLI
+#     Windows でチェックアウトした CRLF でも動くよう CR を落としてから使う。
+# -----------------------------------------------------------------------------
+COPY base/bin/  ${APP_BIN_DIR}/
+COPY base/cli/  ${APP_DIR}/cli/
+COPY base/build/apply-cli.sh /usr/local/bin/apply-cli.sh
+
+RUN set -eu; \
+    sed -i 's/\r$//' "${APP_BIN_DIR}"/*.sh "${APP_DIR}"/cli/*.cli /usr/local/bin/apply-cli.sh; \
+    chmod 0755 "${APP_BIN_DIR}"/*.sh /usr/local/bin/apply-cli.sh; \
+    chmod 0444 "${APP_DIR}"/cli/*.cli
+
+# -----------------------------------------------------------------------------
+#  5. standalone.conf への追記 (JAVA_OPTS_APPEND フック)
+#
+#     ★ standalone.conf は「JAVA_OPTS が未設定のときだけ既定値を組み立てる」
+#       作りなので、外から JAVA_OPTS を渡すと EAP 必須の既定値が全部消える。
+#       共通シェルは JAVA_OPTS_APPEND だけを組み立て、ここで連結する。
+# -----------------------------------------------------------------------------
+COPY base/build/standalone.conf.append /tmp/standalone.conf.append
+RUN set -eu; \
+    sed -i 's/\r$//' /tmp/standalone.conf.append; \
+    cat /tmp/standalone.conf.append >> "${EAP_HOME}/bin/standalone.conf"; \
+    rm -f /tmp/standalone.conf.append
+
+# -----------------------------------------------------------------------------
+#  6. 共通 CLI をビルド時に適用する
+#
+#     ★ 起動時ではなくビルド時に適用する理由
+#       起動時に embed-server を回すと「1 回目の設定ブートストラップ」になり、
+#       続く standalone.sh の本ブートが standalone_xml_history/current の
+#       ディレクトリ rename を試みる。この rename だけはファイルシステムの
+#       実体 (overlayfs か / ボリュームか) に依存し、Compose では警告
+#       (WFLYCTL0414) で済むのに ECS では WFLYCTL0082 でブートが落ちる、
+#       という環境差を生む。ビルド時に済ませておけば起動時の
+#       ブートストラップが 1 回に戻り、この差自体が消える。
+#       (別プロジェクト Container_ExtraSLB_JVM_https_outbounds と同じ判断)
+# -----------------------------------------------------------------------------
+RUN /usr/local/bin/apply-cli.sh \
+      --eap-home "${EAP_HOME}" \
+      --config   "${EAP_CONFIG}" \
+      --cli-dir  "${APP_DIR}/cli" \
+      --pattern  '0*.cli' \
+      --pattern  '1*.cli' \
+      --pattern  '2*.cli'
+
+# -----------------------------------------------------------------------------
+#  7. configuration をシードとして退避
+#     実行時は entrypoint.sh が EAP_RUN_DIR/configuration へ複製する。
+# -----------------------------------------------------------------------------
+RUN set -eu; \
+    rm -rf "${EAP_HOME}/standalone/configuration/standalone_xml_history"; \
+    mkdir -p "${EAP_SEED_DIR}"; \
+    cp -a "${EAP_HOME}/standalone/configuration" "${EAP_SEED_DIR}/configuration"; \
+    chmod -R a+rX "${EAP_SEED_DIR}"; \
+    rm -rf "${EAP_HOME}/standalone/log" "${EAP_HOME}/standalone/data" "${EAP_HOME}/standalone/tmp"; \
+    mkdir -p "${EAP_HOME}/standalone/log" "${EAP_HOME}/standalone/data" "${EAP_HOME}/standalone/tmp"; \
+    printf '%s\n' \
+      'このディレクトリは実行時には使いません。' \
+      'jboss.server.base.dir は entrypoint.sh により EAP_RUN_DIR へ向けられます。' \
+      'front/back のビルドで embed-server を再実行するため、空のまま残しています。' \
+      > "${EAP_HOME}/standalone/README-container.txt"; \
+    mkdir -p "${EAP_RUN_DIR}" "${APP_DIR}"; \
+    chown "${APP_UID}:${APP_GID}" "${EAP_RUN_DIR}"; \
+    chmod 0770 "${EAP_RUN_DIR}"; \
+    chmod -R a+rX "${APP_DIR}"
+
+# -----------------------------------------------------------------------------
+#  8. 実行時の既定値
+#
+#     ここに OTEL_* を書かないのが本構成の方針。OTEL_* は otel-env.sh が
+#     APP_SERVICE / APP_ROLE から導出する。イメージに焼くと環境ごとに
+#     イメージが分かれてしまう。
+# -----------------------------------------------------------------------------
+ENV JBOSS_HOME=${EAP_HOME} \
+    EAP_RUN_DIR=${EAP_RUN_DIR} \
+    EAP_SEED_DIR=${EAP_SEED_DIR} \
+    EAP_CONFIG=${EAP_CONFIG} \
+    EAP_CONFIG_SEED=always \
+    EAP_TMP_DIR=${EAP_RUN_DIR}/tmp \
+    APP_DIR=${APP_DIR} \
+    APP_BIN_DIR=${APP_BIN_DIR} \
+    APP_UID=${APP_UID} \
+    APP_GID=${APP_GID} \
+    APP_ENV=local \
+    APP_NAMESPACE=unset-namespace \
+    EAP_BIND=0.0.0.0 \
+    EAP_BIND_MANAGEMENT=127.0.0.1 \
+    EAP_DROP_PRIVILEGES=auto \
+    ADOT_AGENT_PATH=${ADOT_AGENT_PATH} \
+    OTEL_AGENT_ENABLED=true \
+    HEALTHCHECK_CONTEXT=/app \
+    HEALTHCHECK_PATH=/api/health
+
+LABEL org.opencontainers.image.title="eap81-adot-base" \
+      org.opencontainers.image.description="UBI9.8 + OpenJDK21 + JBoss EAP 8.1 + ADOT Java Agent (X-Ray / Jaeger 両対応)" \
+      adot.java.agent.version="${ADOT_JAVA_AGENT_VERSION}" \
+      eap.run.dir="${EAP_RUN_DIR}"
+
+USER ${APP_UID}:${APP_GID}
+WORKDIR ${EAP_RUN_DIR}
+
+# front / back はこの ENTRYPOINT を継承し、WAR と固有 ENV だけを足す
+ENTRYPOINT ["/opt/app/bin/entrypoint.sh"]
+CMD ["run-server"]

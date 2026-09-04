@@ -1,0 +1,128 @@
+# =============================================================================
+#  otel/collector-compose.yaml
+#
+#  ADOT Collector 設定 (ローカル Compose / 送信先 = Jaeger)
+#
+#  ★ 本番 (otel/collector-xray.yaml) との差分は「★XRAY-DIFF」コメントが
+#    付いた箇所のみ。それ以外の receivers / processors は 1 文字も変えていない。
+#    「ローカルで見えたものは X-Ray でも同じ形で見える」ことを保証するため、
+#    加工処理 (filter / transform) を環境で分けないのが本構成の方針。
+#
+#  ---------------------------------------------------------------------------
+#  データの流れ
+#  ---------------------------------------------------------------------------
+#    front / back (ADOT Java Agent)
+#      --OTLP gRPC adot-collector:4317--> [このコンテナ]
+#           receivers   : otlp
+#           processors  : filter -> resourcedetection -> transform -> batch
+#           exporters   : otlp/jaeger + debug
+#      --> Jaeger UI (http://localhost:16686)
+#
+#  ---------------------------------------------------------------------------
+#  Jaeger でも X-Ray と同じ属性名で見える
+#  ---------------------------------------------------------------------------
+#  transform/xray-annotations をローカルでも通しているので、Jaeger の
+#  Tags 欄にも app_service / app_role / app_caller / app_peer が出る。
+#  Jaeger UI の検索窓に
+#      app_caller=batch-ec2
+#      app_peer=aurora-mysql
+#  と入れれば、X-Ray のフィルタ式
+#      annotation.app_caller = "batch-ec2"
+#      annotation.app_peer   = "aurora-mysql"
+#  と同じ結果が得られる。検索のやり方だけが違い、意味は同じ。
+# =============================================================================
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # ★XRAY-DIFF (1) awsproxy は入れない。
+  #   X-Ray 集中サンプリングはローカルには存在しないため、アプリ側も
+  #   OTEL_TRACES_SAMPLER=parentbased_always_on (otel-env.sh が APP_ENV=local で
+  #   自動選択する) になり、awsproxy を叩きに来ない。
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        # Compose ではコンテナごとにネットワーク名前空間が分かれるため、
+        # アプリからは http://adot-collector:4317 で届く。
+        # (ECS では同じ設定のまま localhost:4317 になる)
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # --- 以下 3 つは collector-xray.yaml と完全に同一 -----------------------------
+  filter/drop-healthcheck:
+    error_mode: ignore
+    traces:
+      span:
+        - 'IsMatch(attributes["url.path"], "/api/health") and kind == 2'
+        - 'IsMatch(attributes["http.target"], "/api/health") and kind == 2'
+        - 'attributes["http.request.header.x-app-caller"] == "healthcheck"'
+        - 'attributes["http.request.header.x_app_caller"] == "healthcheck"'
+
+  # ★XRAY-DIFF (2) detectors から ecs を外す。
+  #   ローカルには ECS タスクメタデータエンドポイントが無く、ecs ディテクタは
+  #   毎回 5 秒タイムアウトしてから諦めるため、起動が無駄に遅くなる。
+  #   env だけ残しておけば OTEL_RESOURCE_ATTRIBUTES は同じように効く。
+  resourcedetection:
+    detectors: [env]
+    timeout: 5s
+    override: false
+
+  transform/xray-annotations:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["app_service"], resource.attributes["app.service"]) where resource.attributes["app.service"] != nil
+          - set(attributes["app_role"],    resource.attributes["app.role"])    where resource.attributes["app.role"] != nil
+          - set(attributes["app_env"],     resource.attributes["deployment.environment.name"]) where resource.attributes["deployment.environment.name"] != nil
+          - set(attributes["app_ns"],      resource.attributes["service.namespace"]) where resource.attributes["service.namespace"] != nil
+          - set(attributes["ecs_service"], resource.attributes["aws.ecs.service.name"]) where resource.attributes["aws.ecs.service.name"] != nil
+          - set(attributes["ecs_task_family"], resource.attributes["aws.ecs.task.family"]) where resource.attributes["aws.ecs.task.family"] != nil
+          - set(attributes["app_peer"], attributes["peer.service"]) where attributes["peer.service"] != nil
+          - set(attributes["app_caller"], attributes["http.request.header.x-app-caller"]) where attributes["http.request.header.x-app-caller"] != nil
+          - set(attributes["app_caller"], attributes["http.request.header.x_app_caller"]) where attributes["http.request.header.x_app_caller"] != nil
+          - set(attributes["app_caller"], attributes["app_caller"][0]) where IsList(attributes["app_caller"])
+          - set(attributes["app_caller"], "user") where attributes["app_caller"] == nil and kind == 2
+
+  batch/traces:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+exporters:
+  # ★XRAY-DIFF (3) 送信先が Jaeger の OTLP 受信口になる。
+  #   Jaeger 1.35 以降は OTLP を直接受けられるので、間に何も挟まない。
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # ローカルでは既定で有効にしておく。
+  #   docker compose logs -f adot-collector
+  # で「アプリからスパンが届いているか」を即座に確認できる。
+  # 「Jaeger に出ない」ときに、アプリが送っていないのか Collector から
+  # Jaeger への送信が失敗しているのかをこれ 1 つで切り分けられる。
+  debug:
+    verbosity: normal
+
+service:
+  extensions: [health_check]         # ★XRAY-DIFF: awsproxy 無し
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors:
+        - filter/drop-healthcheck
+        - resourcedetection          # ★XRAY-DIFF: detectors に ecs を含まない
+        - transform/xray-annotations
+        - batch/traces
+      exporters: [otlp/jaeger, debug]  # ★XRAY-DIFF: 送信先
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: none

@@ -1,0 +1,232 @@
+# =============================================================================
+#  otel/collector-xray.yaml
+#
+#  ADOT Collector サイドカー設定 (本番 ECS / 送信先 = AWS X-Ray)
+#
+#  ---------------------------------------------------------------------------
+#  配置と起動
+#  ---------------------------------------------------------------------------
+#  このファイルの内容を AWS Secrets Manager (または SSM Parameter Store) に
+#  格納し、タスク定義の secrets で環境変数 AOT_CONFIG_CONTENT に注入する。
+#  ADOT Collector は次のコマンドで起動する:
+#
+#      command: ["--config=env:AOT_CONFIG_CONTENT"]
+#
+#  ファイルを直接マウントする方式でもよいが、Fargate ではボリュームに設定を
+#  置く手段が限られるため Secrets 経由が扱いやすい (ecs/taskdef.template.json)。
+#
+#  ---------------------------------------------------------------------------
+#  データの流れ
+#  ---------------------------------------------------------------------------
+#    front / back (ADOT Java Agent)
+#      --OTLP gRPC localhost:4317--> [このサイドカー]
+#           receivers   : otlp
+#           processors  : filter -> resourcedetection -> transform -> batch
+#           exporters   : awsxray
+#      --> AWS X-Ray (サービスマップ / トレース)
+#
+#  ---------------------------------------------------------------------------
+#  Compose 版 (otel/collector-compose.yaml) との差分は、本ファイル中の
+#  「★XRAY-DIFF」コメントが付いた箇所がすべて。それ以外は完全に同一に保つ。
+#  差分の一覧は docs/xray-vs-jaeger.md を参照。
+# =============================================================================
+
+extensions:
+  # サイドカーの死活確認。タスク定義の healthCheck から叩く。
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # ★XRAY-DIFF (1) awsproxy
+  #   X-Ray の「集中サンプリング」を使うための AWS API プロキシ。
+  #   アプリ側 OTEL_TRACES_SAMPLER=xray / OTEL_TRACES_SAMPLER_ARG=endpoint=http://localhost:2000
+  #   がここへサンプリングルールを取りに来る。
+  #   これがあると、X-Ray コンソールのサンプリングルールを変更するだけで
+  #     「/healthz は 0%」「通常は 5%」「障害調査中の 1 時間だけ 100%」
+  #   を再デプロイ無しに切り替えられる。Compose (Jaeger) には対応物が無い。
+  awsproxy:
+    endpoint: 0.0.0.0:2000
+    region: ${env:AWS_REGION}
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        # ECS awsvpc ではタスク内の全コンテナが同じ名前空間なので、
+        # アプリからは localhost:4317 で届く。
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # ---------------------------------------------------------------------------
+  # 1. ヘルスチェックのスパンを捨てる
+  #
+  #    ★ 入れておかないと確実に事故る箇所。
+  #    ALB のヘルスチェックは既定 30 秒間隔、ECS のコンテナヘルスチェックも
+  #    30 秒間隔。front/back × 4 サービス × タスク数ぶんが 24 時間動き続けるため、
+  #    X-Ray に記録されるトレースの大半が /api/health になり、
+  #      - 目的のトレースが埋もれて検索できない
+  #      - X-Ray の記録料金がヘルスチェックで消える
+  #    という状態になる。ここで落とす。
+  #
+  #    本番では加えて X-Ray 集中サンプリング側にも「/api/health は 0%」の
+  #    ルールを置くとアプリからの送信自体が止まり、より確実かつ安価になる。
+  #
+  #    url.path        : semconv 1.21 以降 (新しい Java Agent)
+  #    http.target     : それ以前
+  #    どちらでも拾えるよう両方書く。error_mode: ignore なので、属性が無い
+  #    スパンで条件がエラーになっても他の条件・他のスパンには影響しない。
+  # ---------------------------------------------------------------------------
+  filter/drop-healthcheck:
+    error_mode: ignore
+    traces:
+      span:
+        - 'IsMatch(attributes["url.path"], "/api/health") and kind == 2'
+        - 'IsMatch(attributes["http.target"], "/api/health") and kind == 2'
+        - 'attributes["http.request.header.x-app-caller"] == "healthcheck"'
+        - 'attributes["http.request.header.x_app_caller"] == "healthcheck"'
+
+  # ---------------------------------------------------------------------------
+  # 2. ECS のリソース情報を自動付与
+  #
+  #    ★XRAY-DIFF (2)
+  #    ecs ディテクタが ECS タスクメタデータエンドポイント (v4) を読み、
+  #      aws.ecs.cluster.arn / aws.ecs.task.arn / aws.ecs.task.family /
+  #      aws.ecs.launchtype / aws.ecs.container.arn / cloud.* / container.id
+  #    を付ける。X-Ray のセグメントの aws セクションに入り、コンソールの
+  #    「リソース」表示や、どのタスクが遅いかの特定に効く。
+  #
+  #    override: false … アプリ側 (otel-env.sh) が明示した属性を上書きしない。
+  #    aws.ecs.service.name はメタデータから取れないことがあるため
+  #    otel-env.sh 側で必ずセットしている。そちらを勝たせる。
+  # ---------------------------------------------------------------------------
+  resourcedetection:
+    detectors: [env, ecs]
+    timeout: 5s
+    override: false
+
+  # ---------------------------------------------------------------------------
+  # 3. X-Ray の annotation 用にリソース属性をスパンへ写す
+  #
+  #    ★ ここが「X-Ray から通信を確認しやすくする」ための中核。
+  #
+  #    【なぜ必要か】
+  #      OTEL_RESOURCE_ATTRIBUTES に入れた属性は「リソース属性」であり、
+  #      X-Ray のセグメントでは metadata 側に入る。metadata は
+  #      コンソールで目視はできるが「フィルタ式で検索できない」。
+  #      検索できるのは annotation だけ。annotation にするには
+  #      awsxray exporter の indexed_attributes に列挙する必要があるが、
+  #      これはスパン属性を対象にするため、リソース属性のままでは届かない。
+  #      そこで一度スパン属性へ写す。
+  #
+  #    【キー名を app_service のようにフラットにする理由】
+  #      X-Ray の annotation キーは [A-Za-z0-9_] しか使えない。
+  #      service.namespace のようなドット付きキーはエクスポータ側で
+  #      service_namespace に置換される。置換後の名前を先に決めておかないと
+  #      「コンソールで何と打てば検索できるのか」が分からなくなる。
+  #      ここで明示的に付け替えておけば、フィルタ式は必ず次の形になる:
+  #
+  #        annotation.app_service = "intra-api"
+  #        annotation.app_role    = "back"
+  #        annotation.app_env     = "prd"
+  #        annotation.app_caller  = "batch-ec2"
+  #        annotation.app_peer    = "aurora-mysql"
+  #
+  #    【app_caller / app_peer】
+  #      app_caller … 呼び出し元 (batch-ec2 / lambda-sqs / user / healthcheck)。
+  #                   otel-env.sh の capture-request-headers で取り込んだ
+  #                   X-App-Caller ヘッダ由来。ALB を挟むと呼び出し元が
+  #                   分からなくなる問題への答え。
+  #      app_peer   … 呼び出し先の論理名 (peer.service)。
+  #                   「Aurora を呼んでいるスパンだけ」を横断検索できる。
+  # ---------------------------------------------------------------------------
+  transform/xray-annotations:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          # --- リソース属性 -> スパン属性 (フラットなキーへ) ---
+          - set(attributes["app_service"], resource.attributes["app.service"]) where resource.attributes["app.service"] != nil
+          - set(attributes["app_role"],    resource.attributes["app.role"])    where resource.attributes["app.role"] != nil
+          - set(attributes["app_env"],     resource.attributes["deployment.environment.name"]) where resource.attributes["deployment.environment.name"] != nil
+          - set(attributes["app_ns"],      resource.attributes["service.namespace"]) where resource.attributes["service.namespace"] != nil
+          - set(attributes["ecs_service"], resource.attributes["aws.ecs.service.name"]) where resource.attributes["aws.ecs.service.name"] != nil
+          - set(attributes["ecs_task_family"], resource.attributes["aws.ecs.task.family"]) where resource.attributes["aws.ecs.task.family"] != nil
+
+          # --- 呼び出し先の論理名 (peer.service) ---
+          - set(attributes["app_peer"], attributes["peer.service"]) where attributes["peer.service"] != nil
+
+          # --- 呼び出し元 (X-App-Caller ヘッダ) ---
+          #     Java Agent のバージョンによりキーが x-app-caller / x_app_caller の
+          #     どちらかになるため両方見る。
+          - set(attributes["app_caller"], attributes["http.request.header.x-app-caller"]) where attributes["http.request.header.x-app-caller"] != nil
+          - set(attributes["app_caller"], attributes["http.request.header.x_app_caller"]) where attributes["http.request.header.x_app_caller"] != nil
+          #     ヘッダ由来の値は配列で入ることがある。X-Ray の annotation は
+          #     スカラーしか受け付けないため、配列なら先頭要素に潰す。
+          - set(attributes["app_caller"], attributes["app_caller"][0]) where IsList(attributes["app_caller"])
+          #     ヘッダが無い通常のリクエストは "user" として揃えておくと、
+          #     「バッチ由来を除いた利用者トラフィックだけ」の検索ができる。
+          - set(attributes["app_caller"], "user") where attributes["app_caller"] == nil and kind == 2
+
+  # ---------------------------------------------------------------------------
+  # 4. バッチ送信
+  #    X-Ray の PutTraceSegments 呼び出し回数を抑える。
+  #    timeout を長くしすぎるとコンソールへの反映が遅れるため 1〜5 秒程度。
+  # ---------------------------------------------------------------------------
+  batch/traces:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+exporters:
+  # ---------------------------------------------------------------------------
+  # ★XRAY-DIFF (3) awsxray exporter
+  #
+  #   認証は ECS タスクロール (AWSXRayDaemonWriteAccess 相当) で行う。
+  #   アクセスキーを渡す必要はない。
+  #
+  #   indexed_attributes … annotation として検索可能にする属性。
+  #     index_all_attributes: true にすると全属性が annotation になるが、
+  #     SQL 文や URL まで索引され、annotation 数の上限 (セグメントあたり 50)
+  #     に当たったり不要な情報が索引されたりする。明示列挙が安全。
+  # ---------------------------------------------------------------------------
+  awsxray:
+    region: ${env:AWS_REGION}
+    indexed_attributes:
+      - app_service
+      - app_role
+      - app_env
+      - app_ns
+      - app_peer
+      - app_caller
+      - ecs_service
+      - ecs_task_family
+    index_all_attributes: false
+    # 送信できなかったセグメントを Collector のログに残す。
+    # 「X-Ray に出ない」ときの一次切り分けがここでできる。
+    telemetry:
+      enabled: true
+      include_metadata: true
+
+  # 障害調査時だけ有効化する。既定のパイプラインには入れていない
+  # (常時有効にすると awslogs の料金と CPU を無駄に食う)。
+  debug:
+    verbosity: normal
+
+service:
+  extensions: [health_check, awsproxy]   # ★XRAY-DIFF: awsproxy は X-Ray のみ
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors:
+        - filter/drop-healthcheck
+        - resourcedetection          # ★XRAY-DIFF: detectors に ecs を含む
+        - transform/xray-annotations
+        - batch/traces
+      exporters: [awsxray]           # ★XRAY-DIFF: 送信先
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      # Collector 自身のメトリクスは使わないので無効化 (ポート衝突も避けられる)
+      level: none

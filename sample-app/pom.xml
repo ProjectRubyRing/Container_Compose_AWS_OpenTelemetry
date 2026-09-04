@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  =============================================================================
+   sample-app / pom.xml
+
+   全通信経路を 1 本の WAR で再現するための検証用アプリ。
+   front / back のどちらにも同じ WAR を配備し、振る舞いは APP_ROLE で変える。
+
+   ★ 実プロジェクトでは front/back それぞれのビルド成果物を
+      --build-arg APP_SOURCE=<各チームの war> で差し替えればよい。
+      コンテナ側 (base/front/back) は WAR の中身に一切依存していない。
+
+   ★ 依存関係と OpenTelemetry の関係
+      アプリ側に OpenTelemetry の依存は 1 つも入れない。計装はすべて
+      ADOT Java Agent が実行時にバイトコードへ挿入する。
+      逆に「エージェントが計装できるライブラリ」を選ぶ必要はある:
+        - JDBC        : MySQL Connector/J (JBoss モジュール経由)  -> 計装対象
+        - Valkey      : Jedis 5.x (Redis 互換プロトコル)            -> 計装対象
+        - SQS         : AWS SDK for Java v2                        -> 計装対象
+        - HTTP client : java.net.http.HttpClient (JDK 11+)         -> 計装対象
+  =============================================================================
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.example</groupId>
+  <artifactId>otel-sample-app</artifactId>
+  <version>1.0.0</version>
+  <packaging>war</packaging>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <jakartaee.version>10.0.0</jakartaee.version>
+    <jedis.version>5.2.0</jedis.version>
+    <awssdk.version>2.29.52</awssdk.version>
+  </properties>
+
+  <dependencies>
+    <!-- EAP 8.1 が提供する。WAR には入れない -->
+    <dependency>
+      <groupId>jakarta.platform</groupId>
+      <artifactId>jakarta.jakartaee-web-api</artifactId>
+      <version>${jakartaee.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- ElastiCache for Valkey (Redis 互換プロトコル)。
+         ADOT Java Agent の Jedis 計装が db.system=redis のスパンを作る。
+         valkey-java クライアントはエージェントの計装対象に入っていないため、
+         あえて Jedis を使う (Valkey は Redis 6/7 プロトコル互換)。 -->
+    <dependency>
+      <groupId>redis.clients</groupId>
+      <artifactId>jedis</artifactId>
+      <version>${jedis.version}</version>
+    </dependency>
+
+    <!-- SQS 送信。AWS SDK v2 の計装がメッセージ属性へトレースコンテキストを注入する -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>sqs</artifactId>
+      <version>${awssdk.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>url-connection-client</artifactId>
+      <version>${awssdk.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>app</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-war-plugin</artifactId>
+        <version>3.4.0</version>
+        <configuration>
+          <failOnMissingWebXml>false</failOnMissingWebXml>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

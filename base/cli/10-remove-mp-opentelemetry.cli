@@ -1,0 +1,42 @@
+# =============================================================================
+#  10-remove-mp-opentelemetry.cli
+#
+#  ★ ADOT Java Agent と JBoss EAP 内蔵 opentelemetry サブシステムの
+#    「二重計装」を止める。
+#
+#  【何が起きるか】
+#    EAP 8.x には MicroProfile Telemetry / opentelemetry サブシステムがある。
+#    これが有効なまま -javaagent で ADOT エージェントも入れると、同じ HTTP
+#    リクエストに対して 2 つの独立した SDK がスパンを作る。結果として:
+#      - X-Ray のセグメントが 1 リクエストにつき 2 本並ぶ
+#      - サービスマップに同じサービスのノードが 2 つ出る
+#        (サブシステム側は service.name をデプロイ名から決めるため
+#         "intra-api-front" と "app" のように別名になる)
+#      - どちらの設定が効いているのか切り分けられなくなる
+#
+#  【方針】
+#    エージェント方式を採る以上、サブシステム側は外す。逆にサブシステム方式に
+#    寄せる場合は本 CLI を適用せず、otel-env.sh の OTEL_AGENT_ENABLED=false に
+#    すること。両方入れる構成だけは避ける。
+#
+#  すべて if で存在チェックしているため、サブシステムが元から無い構成
+#  (素の standalone.xml など) に適用しても失敗しない。
+# =============================================================================
+
+if (outcome == success) of /subsystem=opentelemetry:read-resource
+    echo "[cli] opentelemetry サブシステムを削除します (ADOT Java Agent と二重計装になるため)"
+    /subsystem=opentelemetry:remove
+end-if
+
+if (outcome == success) of /subsystem=microprofile-telemetry:read-resource
+    echo "[cli] microprofile-telemetry サブシステムを削除します"
+    /subsystem=microprofile-telemetry:remove
+end-if
+
+if (outcome == success) of /extension=org.wildfly.extension.opentelemetry:read-resource
+    /extension=org.wildfly.extension.opentelemetry:remove
+end-if
+
+if (outcome == success) of /extension=org.wildfly.extension.microprofile.telemetry:read-resource
+    /extension=org.wildfly.extension.microprofile.telemetry:remove
+end-if

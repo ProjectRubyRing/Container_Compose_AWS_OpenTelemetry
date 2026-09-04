@@ -1,0 +1,58 @@
+# =============================================================================
+#  20-datasource-aurora.cli
+#
+#  Aurora Serverless v2 (MySQL 8.4 互換) 向けデータソース。
+#
+#  ★ トレース観点での要点
+#
+#  (1) connection-url にホスト名を「式」で持たせる
+#      ${env.DB_HOST} のまま standalone.xml に保存され、起動時に環境変数から
+#      解決される。同じイメージを Compose (mysql コンテナ) と ECS (Aurora) の
+#      両方で使えるうえ、otel-env.sh が組み立てる peer-service-mapping の
+#      キー (DB_HOST) と必ず一致するので、X-Ray のノード名がずれない。
+#
+#  (2) JDBC の計装はドライバをラップして行われる
+#      ADOT Java Agent が MySQL Connector/J を自動計装するため、CLI 側で
+#      特別な設定は要らない。ただし datasource 経由の取得スパンを出すには
+#      otel-env.sh の OTEL_INSTRUMENTATION_JDBC_DATASOURCE_ENABLED=true が要る。
+#
+#  (3) Aurora Serverless v2 のスケール待ちを可視化する
+#      ACU が 0 付近から立ち上がるとき接続取得が数秒ブロックする。
+#      プール取得スパンが出ていれば X-Ray 上で「SQL は 5ms なのに接続取得が 3s」
+#      と一目で分かる。blocking-timeout-wait-millis を短めにして、詰まりを
+#      タイムアウトとして表面化させる。
+#
+#  (4) validate-on-match / background-validation
+#      Aurora のフェイルオーバ後に古い接続を掴んだままにしない。
+#      死んだ接続で SQL を投げると X-Ray 上は「原因不明の DB エラー」になる。
+# =============================================================================
+
+if (outcome != success) of /subsystem=datasources/jdbc-driver=mysql:read-resource
+    echo "[cli] JDBC ドライバ mysql を登録します"
+    /subsystem=datasources/jdbc-driver=mysql:add( \
+        driver-name=mysql, \
+        driver-module-name=com.mysql, \
+        driver-class-name=com.mysql.cj.jdbc.Driver, \
+        driver-xa-datasource-class-name=com.mysql.cj.jdbc.MysqlXADataSource)
+end-if
+
+if (outcome != success) of /subsystem=datasources/data-source=AppDS:read-resource
+    echo "[cli] データソース AppDS を登録します"
+    /subsystem=datasources/data-source=AppDS:add( \
+        jndi-name="java:jboss/datasources/AppDS", \
+        driver-name=mysql, \
+        connection-url="jdbc:mysql://${env.DB_HOST:localhost}:${env.DB_PORT:3306}/${env.DB_NAME:appdb}?useSSL=${env.DB_USE_SSL:false}&allowPublicKeyRetrieval=true&serverTimezone=UTC&connectionTimeZone=UTC", \
+        user-name="${env.DB_USER:appuser}", \
+        password="${env.DB_PASSWORD:apppassword}", \
+        min-pool-size=${env.DB_MIN_POOL:5}, \
+        max-pool-size=${env.DB_MAX_POOL:20}, \
+        blocking-timeout-wait-millis=${env.DB_BLOCKING_TIMEOUT_MS:10000}, \
+        idle-timeout-minutes=3, \
+        validate-on-match=true, \
+        background-validation=false, \
+        valid-connection-checker-class-name="org.jboss.jca.adapters.jdbc.extensions.mysql.MySQLValidConnectionChecker", \
+        exception-sorter-class-name="org.jboss.jca.adapters.jdbc.extensions.mysql.MySQLExceptionSorter", \
+        statistics-enabled=true, \
+        enabled=true, \
+        use-java-context=true)
+end-if

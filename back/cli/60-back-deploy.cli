@@ -1,0 +1,55 @@
+# =============================================================================
+#  60-back-deploy.cli   (back 固有)
+#
+#  (1) WAR を unmanaged deployment (archive 方式) として standalone.xml に焼く
+#  (2) deployment-scanner を外す
+#  (3) back のポートを 18080 に固定 (front と同一ネットワーク名前空間のため)
+#  (4) DB プールを front より厚くする
+#
+#  ★ ポートを 18080 にする理由
+#    ECS の awsvpc モードでは、タスク内の全コンテナが 1 つのネットワーク
+#    名前空間を共有する。front と back が同じ 8080 を listen すると
+#    後から起動した方が Address already in use で落ちる。
+#    逆にこの共有のおかげで front -> back は localhost:18080 で届き、
+#    ADOT サイドカーへの localhost:4317 も同じ理屈で成立する。
+#    Compose ではここだけがサービス名解決 (back:18080) に変わる。
+# =============================================================================
+
+# --- deployment-scanner を外す ------------------------------------------------
+if (outcome == success) of /subsystem=deployment-scanner/scanner=default:read-resource
+    echo "[cli][back] deployment-scanner を削除します (readonlyRootFilesystem 対応)"
+    /subsystem=deployment-scanner/scanner=default:remove
+end-if
+if (outcome == success) of /subsystem=deployment-scanner:read-resource
+    /subsystem=deployment-scanner:remove
+end-if
+if (outcome == success) of /extension=org.jboss.as.deployment-scanner:read-resource
+    /extension=org.jboss.as.deployment-scanner:remove
+end-if
+
+# --- WAR を unmanaged (fs-archive) で登録 -------------------------------------
+#
+#  ★ runtime-name を back.war にしてコンテキストルートを /back にする。
+#    front (/front) とパスで区別できるようにするため。詳細は
+#    front/cli/50-front-deploy.cli の同じ箇所のコメントを参照。
+if (outcome != success) of /deployment=back.war:read-resource
+    echo "[cli][back] back.war (context=/back) を fs-archive で登録します"
+    /deployment=back.war:add( \
+        runtime-name=back.war, \
+        content=[{"path" => "/opt/app/app.war", "archive" => true}], \
+        enabled=true)
+end-if
+
+# --- back の HTTP ポート ------------------------------------------------------
+/socket-binding-group=standard-sockets/socket-binding=http:write-attribute( \
+    name=port, value="${jboss.http.port:18080}")
+
+# --- back は front / Lambda / バッチからの同時呼び出しを受けるのでプールを厚く --
+#     既定値は環境変数で上書きできるまま (20-datasource-aurora.cli の式を維持)。
+/subsystem=datasources/data-source=AppDS:write-attribute( \
+    name=max-pool-size, value=${env.DB_MAX_POOL:40})
+
+# --- IO ワーカ ----------------------------------------------------------------
+#     Lambda からのバースト (SQS の同時実行数ぶん) を受けるため既定より増やす。
+/subsystem=io/worker=default:write-attribute( \
+    name=task-max-threads, value=${env.IO_TASK_MAX_THREADS:64})

@@ -1,0 +1,16 @@
+# ビルド成果物
+dist/*.war
+sample-app/target/
+ecs/generated/
+
+# EAP 8.1 の配布物 (Red Hat サブスクリプションが必要。リポジトリには入れない)
+vendor/*.zip
+vendor/*.jar
+
+# ローカル設定
+.env
+.env.local
+
+# Python バイトコードキャッシュ
+__pycache__/
+*.pyc

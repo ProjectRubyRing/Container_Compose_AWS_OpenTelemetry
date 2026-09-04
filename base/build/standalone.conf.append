@@ -1,0 +1,30 @@
+
+# =============================================================================
+#  ここから下は base/Containerfile がビルド時に追記した部分
+#
+#  standalone.conf は「JAVA_OPTS が未設定のときだけ既定値を組み立てる」作りに
+#  なっている。したがって外から JAVA_OPTS 環境変数を渡すと、既定値
+#  (-Djava.awt.headless / -Djboss.modules.system.pkgs / ヒープ指定 /
+#   Java 17+ 用の --add-opens 群など) がまるごと消える。
+#  事故を避けるため、追記はここで行い、運用と共通シェルからは
+#  JAVA_OPTS_APPEND だけを使う。
+# =============================================================================
+
+if [ "x${PRESERVE_JAVA_OPTS:-}" != "xtrue" ]; then
+
+    # -------------------------------------------------------------------------
+    # 共通シェル (jvm-env.sh -> otel-env.sh) が組み立てた追記ぶん。
+    #
+    #   -javaagent:/opt/aws/aws-opentelemetry-agent.jar
+    #   -Djava.io.tmpdir=/run/eap/tmp
+    #   -Dnetworkaddress.cache.ttl=30   ...など
+    #
+    # ★ -javaagent はここで JAVA_OPTS に入る。JAVA_TOOL_OPTIONS を使わないのは
+    #   jboss-cli.sh など EAP 以外の JVM まで計装してしまうため
+    #   (詳細は base/bin/otel-env.sh の該当コメント)。
+    # -------------------------------------------------------------------------
+    if [ "x${JAVA_OPTS_APPEND:-}" != "x" ]; then
+        JAVA_OPTS="$JAVA_OPTS ${JAVA_OPTS_APPEND}"
+    fi
+
+fi

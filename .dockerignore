@@ -1,0 +1,10 @@
+.git
+.gitignore
+.gitattributes
+docs/
+scripts/
+ecs/
+sim/
+compose.yaml
+README.md
+sample-app/target/

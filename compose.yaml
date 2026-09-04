@@ -1,0 +1,358 @@
+# =============================================================================
+#  compose.yaml — ECS 1 タスク内マルチコンテナ構成のローカル再現 (送信先 Jaeger)
+#
+#  ---------------------------------------------------------------------------
+#  本番 ECS の想定
+#  ---------------------------------------------------------------------------
+#    ECS サービス: intra-api / intra-web / inter-api / sf-api
+#    1 タスク内のコンテナ:
+#        front           JBoss EAP 8.1 (HTTP 8080)
+#        back            JBoss EAP 8.1 (HTTP 18080)
+#        adot-collector  ADOT Collector サイドカー (OTLP 4317/4318, awsproxy 2000)
+#    awsvpc モードではタスク内の全コンテナが 1 つのネットワーク名前空間を共有し、
+#    互いに localhost で通信する。
+#
+#  ---------------------------------------------------------------------------
+#  ローカル Compose との差
+#  ---------------------------------------------------------------------------
+#  Compose はコンテナごとに名前空間が分かれるため、localhost がサービス名になる。
+#  差が出るのは「接続先ホスト名」だけで、それらはすべて環境変数化してある。
+#
+#    環境変数                      ローカル (Compose)        本番 ECS
+#    ----------------------------- ------------------------- --------------------------
+#    OTEL_EXPORTER_OTLP_ENDPOINT   http://adot-collector:4317 http://localhost:4317
+#    BACKEND_URL                   http://back:18080          http://localhost:18080
+#    DB_HOST                       aurora                     Aurora のクラスタエンドポイント
+#    VALKEY_HOST                   valkey                     ElastiCache のエンドポイント
+#    REPORT_ALB_URL                http://alb:80/report        帳票 ALB の DNS 名
+#    EXTERNAL_SLB_URL              http://external-slb:80      外部 SLB の FQDN
+#    SQS_ENDPOINT                  http://localstack:4566      (未設定 = 実 SQS)
+#
+#  ★ APP_SERVICE / APP_ROLE / APP_ENV / APP_NAMESPACE は両環境で同じ意味を持つ。
+#    service.name はここから otel-env.sh が導出するので、
+#    「ローカルで見た名前」と「X-Ray で見る名前」が一致する。
+#
+#  ---------------------------------------------------------------------------
+#  aurora / valkey / localstack / jaeger / alb / report-ec2 / external-slb /
+#  batch-ec2 / lambda-runner はローカル検証専用。本番タスクには存在しない。
+# =============================================================================
+
+name: eap-adot-otel
+
+# -----------------------------------------------------------------------------
+#  front / back で共通の環境変数。
+#  ここに OTEL_* をベタ書きしないのが本構成の要点。与えるのは APP_* と
+#  接続先ホストだけで、OTEL_* は otel-env.sh が導出する。
+# -----------------------------------------------------------------------------
+x-app-common: &app-common
+  environment: &app-env
+    TZ: Asia/Tokyo
+
+    # --- 命名規約の入力 (これだけで service.name が決まる) -------------------
+    APP_SERVICE: ${APP_SERVICE:-intra-api}   # intra-api|intra-web|inter-api|sf-api
+    APP_ENV: local
+    APP_NAMESPACE: ${APP_NAMESPACE:-shopdemo}
+    APP_VERSION: ${APP_VERSION:-1.0.0}
+
+    # --- ADOT Collector への送信先 (ECS では http://localhost:4317) ----------
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://adot-collector:4317
+    OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+
+    # --- Aurora Serverless v2 (MySQL 8.4) 相当 -------------------------------
+    #     DB_HOST は peer-service-mapping のキーにもなる (otel-env.sh)
+    DB_HOST: aurora
+    DB_PORT: "3306"
+    DB_NAME: ${MYSQL_DATABASE:-appdb}
+    DB_USER: ${MYSQL_APP_USER:-appuser}
+    DB_PASSWORD: ${MYSQL_APP_PASSWORD:-apppassword}
+
+    # --- ElastiCache for Valkey 相当 -----------------------------------------
+    VALKEY_HOST: valkey
+    VALKEY_PORT: "6379"
+
+    # --- 帳票 EC2 / 外部 SLB (どちらも ALB / SLB 越し) ------------------------
+    REPORT_ALB_HOST: alb
+    REPORT_ALB_URL: http://alb:80/report/daily
+    EXTERNAL_SLB_HOST: external-slb
+    EXTERNAL_SLB_URL: http://external-slb:80/outside/api
+
+    # --- SQS (LocalStack) -----------------------------------------------------
+    SQS_HOST: localstack
+    SQS_ENDPOINT: http://localstack:4566
+    SQS_QUEUE_URL: http://localstack:4566/000000000000/${SQS_QUEUE_NAME:-app-queue}
+    AWS_REGION: ${AWS_REGION:-ap-northeast-1}
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+
+  tmpfs:
+    # readonlyRootFilesystem=true 相当。EAP の作業領域は tmpfs に置く。
+    # (ECS では volumes + mountPoints で同じ形にする)
+    - /run/eap:uid=6301,gid=6302,mode=0770
+  read_only: true
+  networks: [lab]
+
+services:
+
+  # ===========================================================================
+  #  front — JBoss EAP 8.1 / APP_ROLE=front / service.name = <APP_SERVICE>-front
+  # ===========================================================================
+  front:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: front/Containerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE_TAG:-app-eap-base:1.0}
+        APP_SOURCE: ${FRONT_WAR:-dist/app.war}
+    image: ${IMAGE_PREFIX:-local}/eap-front:${IMAGE_TAG:-dev}
+    container_name: eap-front
+    environment:
+      <<: *app-env
+      APP_ROLE: front
+      # ECS では http://localhost:18080 (同一タスク内)
+      BACKEND_HOST: back
+      BACKEND_URL: http://back:18080
+    ports:
+      - "8080:8080"
+    depends_on:
+      aurora: { condition: service_healthy }
+      valkey: { condition: service_healthy }
+      adot-collector: { condition: service_started }
+      back: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/opt/app/bin/healthcheck.sh"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  # ===========================================================================
+  #  back — JBoss EAP 8.1 / APP_ROLE=back / service.name = <APP_SERVICE>-back
+  # ===========================================================================
+  back:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: back/Containerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE_TAG:-app-eap-base:1.0}
+        APP_SOURCE: ${BACK_WAR:-dist/app.war}
+    image: ${IMAGE_PREFIX:-local}/eap-back:${IMAGE_TAG:-dev}
+    container_name: eap-back
+    environment:
+      <<: *app-env
+      APP_ROLE: back
+    ports:
+      - "18080:18080"
+    depends_on:
+      aurora: { condition: service_healthy }
+      valkey: { condition: service_healthy }
+      adot-collector: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "/opt/app/bin/healthcheck.sh"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  # ===========================================================================
+  #  adot-collector — ADOT Collector サイドカー
+  #
+  #  ★ 本番との唯一の実装差は --config で読むファイルだけ。
+  #    ECS では Secrets Manager から AOT_CONFIG_CONTENT に注入して
+  #      command: ["--config=env:AOT_CONFIG_CONTENT"]
+  #    とする (ecs/taskdef.template.json)。
+  # ===========================================================================
+  adot-collector:
+    image: ${ADOT_COLLECTOR_IMAGE:-public.ecr.aws/aws-observability/aws-otel-collector:v0.43.3}
+    container_name: eap-adot-collector
+    command: ["--config=/etc/otel/collector-compose.yaml"]
+    volumes:
+      - ./otel/collector-compose.yaml:/etc/otel/collector-compose.yaml:ro
+    environment:
+      AWS_REGION: ${AWS_REGION:-ap-northeast-1}
+    ports:
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+      - "13133:13133"  # health_check
+    depends_on:
+      jaeger: { condition: service_started }
+    networks: [lab]
+
+  # ===========================================================================
+  #  jaeger — ローカルの可視化先 (本番は X-Ray)
+  # ===========================================================================
+  jaeger:
+    image: ${JAEGER_IMAGE:-jaegertracing/all-in-one:1.62.0}
+    container_name: eap-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI  -> http://localhost:16686
+    networks: [lab]
+
+  # ===========================================================================
+  #  aurora — Aurora Serverless v2 (MySQL 8.4 互換) のローカル代替
+  # ===========================================================================
+  aurora:
+    image: ${MYSQL_IMAGE:-mysql:8.4}
+    container_name: eap-aurora
+    command:
+      - mysqld
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --mysql-native-password=ON
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-appdb}
+      MYSQL_USER: ${MYSQL_APP_USER:-appuser}
+      MYSQL_PASSWORD: ${MYSQL_APP_PASSWORD:-apppassword}
+      TZ: UTC
+    volumes:
+      - aurora-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+    networks: [lab]
+
+  # ===========================================================================
+  #  valkey — ElastiCache for Valkey のローカル代替
+  #
+  #  ★ アプリ側は Jedis (Redis クライアント) で接続する。
+  #    Valkey は Redis プロトコル互換なので通信できるうえ、ADOT Java Agent の
+  #    計装対象に入っているため db.system=redis のスパンが出る。
+  #    valkey-java クライアントを使うと計装対象外になりスパンが出ないので注意。
+  # ===========================================================================
+  valkey:
+    image: ${VALKEY_IMAGE:-valkey/valkey:8-alpine}
+    container_name: eap-valkey
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks: [lab]
+
+  # ===========================================================================
+  #  alb — ALB のトレース関連挙動 (X-Amzn-Trace-Id の採番/透過) を再現
+  #
+  #  ルーティング:
+  #    /report/* -> report-ec2:8000  (帳票 EC2)
+  #    /back/*   -> back:18080       (Lambda / バッチからの back 呼び出し)
+  #    /front/*  -> front:8080
+  #    それ以外  -> front:8080
+  #
+  #  ★ front / back のコンテキストルートを /front と /back に分けてある
+  #    (front/cli/50-front-deploy.cli, back/cli/60-back-deploy.cli)。
+  #    実 ALB はパスを書き換えずそのまま転送するため、両方が /app だと
+  #    パスベースのルールで振り分けられない。
+  # ===========================================================================
+  alb:
+    build:
+      context: ./sim/alb
+    container_name: eap-alb
+    environment:
+      LISTEN_PORT: "80"
+      ROUTES: "^/report=report-ec2:8000,^/back=back:18080,^/front=front:8080,^/=front:8080"
+    ports:
+      - "8081:80"
+    networks: [lab]
+
+  # ===========================================================================
+  #  report-ec2 — 帳票 EC2 サーバ (あえて計装しない)
+  # ===========================================================================
+  report-ec2:
+    build:
+      context: ./sim/report-ec2
+    container_name: eap-report-ec2
+    environment:
+      PORT: "8000"
+      STUB_NAME: report-ec2
+      DELAY_MS: "150"    # 帳票生成にかかる時間を模す
+    networks: [lab]
+
+  # ===========================================================================
+  #  external-slb — 外部ロードバランサー経由の VPC 外通信先 (計装しない)
+  #
+  #  実際には HTTPS になる。TLS トラストストアの作り込みは別プロジェクト
+  #  (Container_ExtraSLB_JVM_https_outbounds) で扱っており、本構成は
+  #  jvm-env.sh から EXTRASLB_TRUSTSTORE_PATH を拾って適用するだけにしてある。
+  # ===========================================================================
+  external-slb:
+    build:
+      context: ./sim/report-ec2
+    container_name: eap-external-slb
+    environment:
+      PORT: "80"
+      STUB_NAME: external-slb
+      DELAY_MS: "200"
+    networks: [lab]
+
+  # ===========================================================================
+  #  localstack — SQS のローカル代替
+  # ===========================================================================
+  localstack:
+    image: ${LOCALSTACK_IMAGE:-localstack/localstack:3.8}
+    container_name: eap-localstack
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-ap-northeast-1}
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./scripts/localstack-init:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+    networks: [lab]
+
+  # ===========================================================================
+  #  lambda-runner — SQS をトリガーに ALB 経由で back を呼ぶ Lambda のスタブ
+  # ===========================================================================
+  lambda-runner:
+    build:
+      context: ./sim/lambda
+    container_name: eap-lambda-runner
+    environment:
+      SQS_ENDPOINT: http://localstack:4566
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/${SQS_QUEUE_NAME:-app-queue}
+      TARGET_URL: http://alb:80/back/api/from-lambda
+      POLL_INTERVAL: "2"
+    depends_on:
+      localstack: { condition: service_healthy }
+    networks: [lab]
+
+  # ===========================================================================
+  #  batch-ec2 — EC2 バッチサーバのスタブ (ALB 経由でコンテナを呼ぶ / 計装しない)
+  #
+  #  profiles により通常の up では起動しない。定常的にトレースを流したいときだけ:
+  #      docker compose --profile batch up -d batch-ec2
+  # ===========================================================================
+  batch-ec2:
+    build:
+      context: ./sim/batch-ec2
+    container_name: eap-batch-ec2
+    profiles: ["batch"]
+    environment:
+      ALB_URL: http://alb:80
+      INTERVAL: "30"
+      CALLER: batch-ec2
+      STARTUP_DELAY: "30"
+      PATHS: "/front/api/db /front/api/cache /back/api/db"
+    depends_on:
+      alb: { condition: service_started }
+    networks: [lab]
+
+volumes:
+  aurora-data:
+
+networks:
+  lab:
+    driver: bridge
