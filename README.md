@@ -36,6 +36,9 @@ base/                     ★ front/back 共通のベースコンテナ
     00-server-common.cli    アクセスログ (trace 相関) / proxy-address-forwarding
     10-remove-mp-opentelemetry.cli  ★ EAP 内蔵 OTel を外して二重計装を防ぐ
     20-datasource-aurora.cli        Aurora Serverless v2 (MySQL 8.4)
+    30-elytron-https-remove.cli     ★ 未使用の既定 HTTPS/キーストアを削除 (WFLYELY00023/01084 の根本回避)
+    31-logging-suppress-known-warnings.cli
+                                    ★ 既知 WARN を filter-spec で直接抑制
   build/
     apply-cli.sh            ビルド時に embed-server で CLI を適用
     standalone.conf.append  JAVA_OPTS_APPEND フック
@@ -225,6 +228,57 @@ aws ecs register-task-definition --cli-input-json file://ecs/generated/intra-api
 | CLI はビルド時に適用 | 起動時 `embed-server` は設定ブートストラップを 2 回にし、`standalone_xml_history` の rename が Compose では警告・ECS では起動失敗という環境差を生む |
 | Valkey は Jedis / Lettuce で | `valkey-java` はエージェントの計装対象外。使うとキャッシュアクセスのスパンが一切出ない |
 | コンテキストルートを分ける | front=`/front` / back=`/back`。実 ALB はパスを書き換えず転送するため、両方 `/app` だとパスベースのルールで振り分けられない |
+
+---
+
+## 起動時 WARN の扱い
+
+毎起動出る既知の WARN は、**(A) 設定値を整えて発生自体を無くす**（根本回避）と
+**(B) ログを直接抑制する**（フィルタ）の 2 系統を両方用意してある。
+既定では A で消えるので B は保険として効いている状態になる。
+
+| WARN | 発生源 | (A) 根本回避 — 既定 | (B) 直接抑制 |
+|---|---|---|---|
+| `ServiceEventConfig - OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED=true but OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE is empty` | ADOT Java Agent | `otel-env.sh` が対象パッケージ未指定なら `..._FUNCTION_INSTRUMENT_ENABLED=false` を明示 | `-Dio.opentelemetry.javaagent.slf4j.simpleLogger.log.software.amazon.opentelemetry.javaagent.instrumentation.serviceevents=error` |
+| `DbConfig - The otel.instrumentation.common.db-statement-sanitizer.enabled system property is deprecated ... Use otel.instrumentation.common.db.query-sanitization.enabled instead` | ADOT Java Agent | `otel-env.sh` が新キー `OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED` だけを渡す（旧キーは渡さない／外から来ても読み替えて落とす） | `-Dio.opentelemetry.javaagent.slf4j.simpleLogger.log.io.opentelemetry.javaagent.shaded.instrumentation.api.incubator.config.internal.DbConfig=error` |
+| `WFLYELY00023: KeyStore ファイル '.../application.keystore' は存在しません。空白を利用しました` | `org.wildfly.extension.elytron` | `30-elytron-https-remove.cli` が未使用の `https-listener` / `applicationSSC` / `applicationKM` / `applicationKS` / `socket-binding=https` を削除 | `31-logging-suppress-known-warnings.cli` の `filter-spec` |
+| `WFLYELY01084: キーストア ... が見つかりません。初回使用時に自己署名証明書を使用して自動生成されます` | `org.wildfly.extension.elytron` | 同上 | 同上 |
+
+### なぜ 2 系統あるのか
+
+- **A だけでは足りない場面がある。** `SERVER_SOURCE=image`（社内の EAP ランタイムイメージ）では既定の
+  `standalone.xml` に別名のキーストア定義が入っていることがあり、リソース名を決め打ちした削除は空振りする。
+  メッセージ ID を見る B は名前が変わっても効く。エージェント側も、版が上がって既定値が変われば A の前提が崩れる。
+- **B だけでは足りない。** 「見えなくなった」だけで設定の矛盾は残る。ADOT の関数計装は
+  「有効だが対象ゼロ」のまま、非推奨キーは 3.0 で削除されて意味を失う。A で状態そのものを正す。
+
+### 抑制の効き方
+
+- **ADOT エージェントのログは JBoss の logging サブシステムを通らない。**
+  `OTEL_JAVAAGENT_LOGGING=simple` ではシェーディングされた slf4j-simple が stderr へ直接書くため、
+  `standalone.xml` の `filter-spec` では止まらない。止められるのは JVM のシステムプロパティだけで、
+  接頭辞は `io.opentelemetry.javaagent.slf4j.simpleLogger.log.<ロガー名>`（`otel-env.sh` が組み立てる）。
+- **EAP 側は `filter-spec` で消す。** レベルを上げる（`org.wildfly.extension.elytron` を ERROR にする）と
+  他の WARN まで消えるため、メッセージ ID を `not(any(match("WFLYELY00023"),match("WFLYELY01084")))` で
+  名指しする。`jboss-logmanager` は発生元ロガーのフィルタしか見ない（root-logger に付けても効かない）ので、
+  カテゴリと CONSOLE ハンドラの両方に入れてある。
+
+### 環境変数 / ビルド引数
+
+| 変数 | 既定 | 用途 |
+|---|---|---|
+| `APP_SERVICE_EVENT_PACKAGES` | 空 | ADOT の関数レベル計装を**使う**場合の対象パッケージ（例 `com.example.app`）。指定すると `..._FUNCTION_INSTRUMENT_ENABLED=true` が自動で付く。★スパン数＝X-Ray 課金が跳ねるので必ず絞る |
+| `OTEL_AGENT_LOG_SUPPRESS` | `true` | エージェントログの直接抑制の ON/OFF。`false` にすると本来の WARN が見える |
+| `OTEL_AGENT_LOG_SUPPRESS_SPEC` | 上表の 2 件 | `<ロガー名>=<レベル>,...`。レベル省略時は `error`。ロガー名はパッケージ単位でも可 |
+| `OTEL_AGENT_LOG_LEVEL` | 未設定 | エージェントログ全体の下限（最終手段）。設定すると未知の WARN も見えなくなる |
+| `EAP_HTTPS_MODE` (build-arg) | `remove` | `remove`=既定 HTTPS 一式を削除 / `keystore`=8443 を残しビルド時に `application.keystore` を生成 / `keep`=既定のまま（B のフィルタのみ） |
+
+抑制を一時的に外して素の出力を見るには:
+
+```sh
+docker compose run --rm -e OTEL_AGENT_LOG_SUPPRESS=false front
+docker build -f base/Containerfile --build-arg EAP_HTTPS_MODE=keep -t app-eap-base:1.0 .
+```
 
 ---
 

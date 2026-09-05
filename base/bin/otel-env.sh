@@ -299,10 +299,39 @@ export OTEL_INSTRUMENTATION_AWS_SDK_EXPERIMENTAL_USE_PROPAGATOR_FOR_MESSAGING \
 #  JBoss のデータソース (プール) から接続を取る所にもスパンを出す。
 #  「SQL は速いのにプール枯渇で待たされている」を X-Ray 上で切り分けられる。
 : "${OTEL_INSTRUMENTATION_JDBC_DATASOURCE_ENABLED:=true}"
+export OTEL_INSTRUMENTATION_JDBC_DATASOURCE_ENABLED
+
 #  SQL のリテラルを ? に伏せる (既定 true)。個人情報が X-Ray に出るのを防ぐ。
-: "${OTEL_INSTRUMENTATION_COMMON_DB_STATEMENT_SANITIZER_ENABLED:=true}"
-export OTEL_INSTRUMENTATION_JDBC_DATASOURCE_ENABLED \
-       OTEL_INSTRUMENTATION_COMMON_DB_STATEMENT_SANITIZER_ENABLED
+#
+#  ★ 設定キーの新旧に注意 (WARN 対策 / 根本回避)
+#    旧: otel.instrumentation.common.db-statement-sanitizer.enabled
+#        (= OTEL_INSTRUMENTATION_COMMON_DB_STATEMENT_SANITIZER_ENABLED)
+#    新: otel.instrumentation.common.db.query-sanitization.enabled
+#        (= OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED)
+#
+#    旧キーを設定していると、エージェントが起動のたびに
+#
+#      WARN io.opentelemetry.javaagent.shaded.instrumentation.api.incubator
+#           .config.internal.DbConfig - The otel.instrumentation.common
+#           .db-statement-sanitizer.enabled system property is deprecated and
+#           will be removed in 3.0 Use otel.instrumentation.common
+#           .db.query-sanitization.enabled instead
+#
+#    を出す。「旧キーが設定されている」ことが唯一の発火条件なので、
+#    新キーへ移せば根本から消える。値の意味 (true = リテラルを伏せる) は同じ。
+#
+#    旧キーしか解釈しない古いエージェントに戻す場合でも、既定値が true の
+#    ため「伏せられない」事故にはならない。明示的に無効化したいときだけ
+#      APP_EXTRA_JAVA_OPTS="-Dotel.instrumentation.common.db-statement-sanitizer.enabled=false"
+#    を渡すこと (この経路なら WARN も承知の上と分かる)。
+if [ -n "${OTEL_INSTRUMENTATION_COMMON_DB_STATEMENT_SANITIZER_ENABLED:-}" ]; then
+    otel_warn "OTEL_INSTRUMENTATION_COMMON_DB_STATEMENT_SANITIZER_ENABLED は非推奨キーです (ADOT/OTel 3.0 で削除)。OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED へ読み替えて渡します。呼び出し側 (compose / タスク定義) の変数名を変更してください。"
+    : "${OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED:=${OTEL_INSTRUMENTATION_COMMON_DB_STATEMENT_SANITIZER_ENABLED}}"
+    # ★ 旧キーは JVM へ渡さない。渡した時点で deprecation WARN が出る。
+    unset OTEL_INSTRUMENTATION_COMMON_DB_STATEMENT_SANITIZER_ENABLED
+fi
+: "${OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED:=true}"
+export OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED
 
 # --- 呼び出し元の識別 ---
 #  EC2 バッチ / Lambda / 利用者ブラウザのどれが入口かを X-Ray で絞り込めるよう、
@@ -313,12 +342,125 @@ export OTEL_INSTRUMENTATION_JDBC_DATASOURCE_ENABLED \
 : "${OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS:=x-app-caller}"
 export OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS
 
+# --- AWS Service Events (関数レベル計装) ---
+#
+#  ★ WARN の根本回避 (設定値で消す)
+#
+#    ADOT Java Agent には AWS Service Events という「アプリの関数 (メソッド)
+#    単位でイベントを出す」計装がある。この機能は
+#        OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED   有効/無効
+#        OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE               対象パッケージ
+#    の 2 つで制御するが、前者の既定が true / 後者の既定が空 のため、
+#    何も設定しないと起動のたびに
+#
+#      WARN software.amazon.opentelemetry.javaagent.instrumentation
+#           .serviceevents.config.ServiceEventConfig -
+#           OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED=true but
+#           OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE is empty ?
+#           no functions will be instrumented. Set PACKAGES_INCLUDE to opt in.
+#
+#    が出る。これは「有効なのに対象が 1 つも無い = 設定が矛盾している」
+#    という警告なので、どちらかに寄せれば根本から消える。
+#
+#      (a) 使わない : ENABLED=false               … 本構成の既定
+#      (b) 使う     : PACKAGES_INCLUDE を指定     … ENABLED は自動で true
+#
+#    (b) にする場合は APP_SERVICE_EVENT_PACKAGES へ対象パッケージを
+#    カンマ区切りで渡す (例: APP_SERVICE_EVENT_PACKAGES=com.example.app)。
+#    ★ 関数単位の計装はスパン数が一気に増える = X-Ray の課金に直結する。
+#      パッケージは必ず絞ること。ワイルドカード的に com などを指定しない。
+: "${OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE:=${APP_SERVICE_EVENT_PACKAGES:-}}"
+if [ -n "${OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE}" ]; then
+    : "${OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED:=true}"
+    export OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE
+else
+    : "${OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED:=false}"
+    # 空文字のまま渡すと「空を明示指定した」ことになり WARN の条件を満たす。
+    unset OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE
+fi
+export OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED
+
+# 外から ENABLED=true だけを渡された場合 (= 矛盾したまま) は、こちらから
+# 理由を示す。ADOT の WARN より前に出るので原因がすぐ分かる。
+if [ "${OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED}" = "true" ] \
+   && [ -z "${OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE:-}" ]; then
+    otel_warn "OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED=true ですが対象パッケージが空です。関数計装は行われず、ADOT エージェントが起動時に WARN を出します。APP_SERVICE_EVENT_PACKAGES を指定するか、ENABLED を false にしてください。"
+fi
+
 # --- エージェント自身のログ ---
 #  JBoss は独自の LogManager を使う。エージェントが JUL を先に初期化すると
 #  "The LogManager was not properly installed" が出ることがある。
 #  simple は JUL を経由せず stderr へ直接書くため、その競合を避けられる。
+#
+#  値: simple (既定) | application | none
+#      none にするとエージェントのログが一切出なくなる。WARN は消えるが
+#      エクスポート失敗などの ERROR まで消えるため、常用は勧めない。
 : "${OTEL_JAVAAGENT_LOGGING:=simple}"
 export OTEL_JAVAAGENT_LOGGING
+
+# --- エージェントログの直接抑制 (カテゴリ単位) ---
+#
+#  ★ 「設定値での回避」とは別に、ログそのものを黙らせる手段も用意する。
+#
+#    エージェントのログは JBoss の logging サブシステムを通らない
+#    (simple ロガーが stderr へ直接書く) ため、standalone.xml の
+#    logger / filter-spec では止められない。止められるのは JVM の
+#    システムプロパティだけ。
+#
+#    エージェント JAR は slf4j を io.opentelemetry.javaagent.slf4j へ
+#    シェーディングして同梱している。したがって slf4j-simple の
+#    設定プロパティも同じ接頭辞になる。
+#
+#      -Dio.opentelemetry.javaagent.slf4j.simpleLogger.log.<ロガー名>=<レベル>
+#      -Dio.opentelemetry.javaagent.slf4j.simpleLogger.defaultLogLevel=<レベル>
+#
+#    <ロガー名> はドットを辿って上位に継承されるので、クラス単位でも
+#    パッケージ単位でも指定できる。レベルは
+#      trace | debug | info | warn | error | off
+#    error にすると WARN 以下が消え、ERROR は残る (= 事故は見逃さない)。
+#
+#    書式: OTEL_AGENT_LOG_SUPPRESS_SPEC="<ロガー名>=<レベル>,<ロガー名>=<レベル>"
+#          レベル省略時は error。抑制自体を止めるなら
+#          OTEL_AGENT_LOG_SUPPRESS=false。
+#
+#    既定で黙らせている 2 件 (どちらも上流の設定値でも回避済み。こちらは
+#    エージェントの版が上がって既定値が変わった場合などの二重の保険):
+#      1. serviceevents          … PACKAGES_INCLUDE 空の WARN
+#      2. ...config.internal.DbConfig … 非推奨キーの deprecation WARN
+: "${OTEL_AGENT_LOG_SUPPRESS:=true}"
+: "${OTEL_AGENT_LOG_SUPPRESS_SPEC:=software.amazon.opentelemetry.javaagent.instrumentation.serviceevents=error,io.opentelemetry.javaagent.shaded.instrumentation.api.incubator.config.internal.DbConfig=error}"
+
+#    ※ OTEL_JAVAAGENT_LOGGING=application のときはエージェントのログが
+#      JBoss の logging サブシステムを通るため、この system property は効かない。
+#      その場合は base/cli/31-logging-suppress-known-warnings.cli 側の
+#      filter-spec に条件を足して止めること。
+_agent_log_suppress_state="off"
+if [ "${OTEL_AGENT_LOG_SUPPRESS}" = "true" ]; then
+    if [ "${OTEL_JAVAAGENT_LOGGING}" = "simple" ]; then
+        # ロガー名・レベルに空白は入らないので、カンマを空白に変えて分割する。
+        for _sup in $(echo "${OTEL_AGENT_LOG_SUPPRESS_SPEC}" | tr ',' ' '); do
+            _sup_logger="${_sup%%=*}"
+            _sup_level="${_sup#*=}"
+            [ -n "${_sup_logger}" ] || continue
+            [ "${_sup_level}" != "${_sup}" ] || _sup_level="error"
+            JAVA_OPTS_APPEND="${JAVA_OPTS_APPEND:-} -Dio.opentelemetry.javaagent.slf4j.simpleLogger.log.${_sup_logger}=${_sup_level}"
+        done
+        export JAVA_OPTS_APPEND
+        unset _sup _sup_logger _sup_level
+        _agent_log_suppress_state="on"
+    else
+        _agent_log_suppress_state="skipped (OTEL_JAVAAGENT_LOGGING=${OTEL_JAVAAGENT_LOGGING})"
+    fi
+fi
+
+# エージェントのログ全体の下限。「WARN を一切見たくない」場合の最終手段。
+#   OTEL_AGENT_LOG_LEVEL=error
+# ※ 個別抑制で足りるうちは設定しないこと。設定した瞬間、まだ知らない
+#   WARN (例: Collector へ繋がらない) まで見えなくなる。
+if [ -n "${OTEL_AGENT_LOG_LEVEL:-}" ] && [ "${OTEL_JAVAAGENT_LOGGING}" = "simple" ]; then
+    JAVA_OPTS_APPEND="${JAVA_OPTS_APPEND:-} -Dio.opentelemetry.javaagent.slf4j.simpleLogger.defaultLogLevel=${OTEL_AGENT_LOG_LEVEL}"
+    export JAVA_OPTS_APPEND
+fi
 
 # -----------------------------------------------------------------------------
 # 8. Java Agent の投入
@@ -376,6 +518,9 @@ otel_print_summary() {
     otel_log "  OTEL_PROPAGATORS                 = ${OTEL_PROPAGATORS}"
     otel_log "  OTEL_TRACES_SAMPLER              = ${OTEL_TRACES_SAMPLER} ${OTEL_TRACES_SAMPLER_ARG:-}"
     otel_log "  peer-service-mapping             = ${OTEL_INSTRUMENTATION_COMMON_PEER_SERVICE_MAPPING:-(なし)}"
+    otel_log "  service-events (function 計装)   = ${OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED} packages=${OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE:-(なし)}"
+    otel_log "  db query sanitization            = ${OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED}"
+    otel_log "  agent log suppress               = ${_agent_log_suppress_state} [${OTEL_AGENT_LOG_SUPPRESS_SPEC}]"
     otel_log "  JBOSS_MODULES_SYSTEM_PKGS        = ${JBOSS_MODULES_SYSTEM_PKGS}"
     otel_log "  JAVA_OPTS_APPEND                 = ${JAVA_OPTS_APPEND:-(なし)}"
     otel_log "----------------------------------------------------------"

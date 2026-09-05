@@ -1,0 +1,83 @@
+# =============================================================================
+#  31-logging-suppress-known-warnings.cli
+#
+#  ★ 既知 WARN の「直接抑制」(設定値での回避とは別経路)
+#
+#  30-elytron-https-remove.cli を適用していれば WFLYELY00023 / WFLYELY01084 は
+#  そもそも発生しない。それでもこのフィルタを入れておくのは次の 3 つの理由から。
+#
+#    1. EAP_HTTPS_MODE=keep で HTTPS を残す運用でも、同じイメージ構成のまま
+#       ログだけは静かにできるようにしておく。
+#    2. SERVER_SOURCE=image (社内の EAP ランタイムイメージ) では、既定の
+#       standalone.xml に別名のキーストア定義が入っていることがある。
+#       名前が違っても メッセージ ID は同じなので、こちらで確実に止まる。
+#    3. front/back で追加した CLI が elytron を復活させてしまった場合の保険。
+#
+#  ---------------------------------------------------------------------------
+#  仕組み: filter-spec
+#  ---------------------------------------------------------------------------
+#    logging サブシステムの filter-spec は jboss-logmanager のフィルタ式。
+#      match("<正規表現>")      フォーマット済みメッセージに部分一致
+#      not(...) / any(...) / all(...)   論理演算
+#    WildFly のメッセージは必ず "WFLYELY00023: ..." のように ID が本文の先頭に
+#    入るため、ID で正確に 1 件だけを落とせる。レベルを WARN -> ERROR に
+#    上げるようなやり方と違い、他の WARN は残る。
+#
+#  ---------------------------------------------------------------------------
+#  なぜ「カテゴリ」と「ハンドラ」の両方に入れるのか
+#  ---------------------------------------------------------------------------
+#    jboss-logmanager はレコードを発生させたロガー自身のフィルタしか評価しない
+#    (親ロガーのフィルタは効かない)。したがって
+#      - カテゴリ側 (org.wildfly.extension.elytron) … 発生源で落とす。最小の副作用。
+#      - ハンドラ側 (CONSOLE / FILE)                … 実際にどのカテゴリから
+#        出ていても確実に落とす。root-logger に付けても効かないのはこのため。
+#    の二段にしてある。どちらか片方だけでも通常は足りる。
+#
+#  ---------------------------------------------------------------------------
+#  ★ ADOT Java Agent の WARN はここでは止められない
+#  ---------------------------------------------------------------------------
+#    エージェントのログ (software.amazon... / io.opentelemetry...) は
+#    OTEL_JAVAAGENT_LOGGING=simple のとき JBoss の logging サブシステムを
+#    通らず stderr へ直接書かれる。抑制は JVM のシステムプロパティで行う
+#    (base/bin/otel-env.sh の OTEL_AGENT_LOG_SUPPRESS を参照)。
+#
+#  ---------------------------------------------------------------------------
+#  抑制対象を増やすとき
+#  ---------------------------------------------------------------------------
+#    下の filter-spec の any(...) にメッセージ ID を足す。例:
+#      not(any(match("WFLYELY00023"),match("WFLYELY01084"),match("WFLYSRV0059")))
+#    ★ 消すのは「原因が分かっていて、対処済みで、毎起動出る」ものだけにすること。
+#      理由の分からない WARN を消すと、後日の障害調査で最初の手掛かりを失う。
+# =============================================================================
+
+# --- 1. 発生源のカテゴリで落とす ---------------------------------------------
+if (outcome == success) of /subsystem=logging/logger=org.wildfly.extension.elytron:read-resource
+    echo "[cli] logger=org.wildfly.extension.elytron の filter-spec を更新します"
+    /subsystem=logging/logger=org.wildfly.extension.elytron:write-attribute( \
+        name=filter-spec, \
+        value="not(any(match(\"WFLYELY00023\"),match(\"WFLYELY01084\")))")
+else
+    echo "[cli] logger=org.wildfly.extension.elytron を追加します (WFLYELY00023 / WFLYELY01084 を抑制)"
+    /subsystem=logging/logger=org.wildfly.extension.elytron:add( \
+        filter-spec="not(any(match(\"WFLYELY00023\"),match(\"WFLYELY01084\")))")
+end-if
+
+# --- 2. コンソールハンドラでも落とす (awslogs へ流れるのはこちら) -------------
+#     ★ 既に filter-spec を使っている場合は上書きになる。両立させるなら
+#       all(<既存>,not(any(...))) の形にまとめること。
+if (outcome == success) of /subsystem=logging/console-handler=CONSOLE:read-resource
+    echo "[cli] console-handler=CONSOLE に filter-spec を設定します"
+    /subsystem=logging/console-handler=CONSOLE:write-attribute( \
+        name=filter-spec, \
+        value="not(any(match(\"WFLYELY00023\"),match(\"WFLYELY01084\")))")
+end-if
+
+# --- 3. ファイルハンドラ (存在する構成のみ) -----------------------------------
+#     コンテナでは参照されないが、ログの内容がコンソールとずれると
+#     調査時に混乱するので揃えておく。
+if (outcome == success) of /subsystem=logging/periodic-rotating-file-handler=FILE:read-resource
+    echo "[cli] periodic-rotating-file-handler=FILE に filter-spec を設定します"
+    /subsystem=logging/periodic-rotating-file-handler=FILE:write-attribute( \
+        name=filter-spec, \
+        value="not(any(match(\"WFLYELY00023\"),match(\"WFLYELY01084\")))")
+end-if

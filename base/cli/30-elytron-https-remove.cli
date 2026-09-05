@@ -1,0 +1,82 @@
+# =============================================================================
+#  30-elytron-https-remove.cli
+#
+#  ★ WFLYELY00023 / WFLYELY01084 の「根本回避」
+#
+#  【出ている WARN】
+#    WARN [org.wildfly.extension.elytron] WFLYELY00023: KeyStore ファイル
+#      '.../configuration/application.keystore' は存在しません。空白を利用しました
+#    WARN [org.wildfly.extension.elytron] WFLYELY01084: キーストア
+#      .../configuration/application.keystore が見つかりません。これは初回使用時に
+#      ホスト localhost の自己署名証明書を使用して自動生成されます
+#
+#  【なぜ出るのか】
+#    EAP / WildFly の既定 standalone.xml には、開発時にすぐ HTTPS を試せるよう
+#      undertow: https-listener=https  (socket-binding=https / 8443)
+#      elytron : server-ssl-context=applicationSSC
+#                 -> key-manager=applicationKM (generate-self-signed-certificate-host=localhost)
+#                     -> key-store=applicationKS (file=application.keystore)
+#    が最初から入っている。application.keystore は「初回起動時に自己署名証明書で
+#    自動生成する」前提のファイルで、イメージには含まれない。
+#    そのため起動のたびに elytron が
+#      「ファイルが無い -> 空のキーストアで起動する (00023)」
+#      「無いので初回使用時に自己署名証明書で作る (01084)」
+#    を報告する。つまり「壊れている」のではなく「未使用の既定 HTTPS 設定が
+#    そこにある」ことの通知にすぎない。
+#
+#  【この構成での正解】
+#    TLS 終端は ALB (本番) / なし (Compose) で、コンテナは常に平文 HTTP しか
+#    受けない。8443 は ECS のタスク定義でも compose.yaml でも公開していない。
+#    使わない HTTPS 一式を standalone.xml から外せば、
+#      - WARN が原理的に発生しなくなる (抑制ではなく消滅)
+#      - 未使用の TLS スタックとキーストア自動生成が攻撃面から消える
+#      - 起動時の自己署名証明書生成 (数百 ms) が無くなる
+#    となり、副作用は「コンテナに直接 HTTPS で繋げなくなる」ことだけ。
+#
+#  【HTTPS を残したい場合】
+#    このファイルを適用しないこと。base/Containerfile のビルド引数
+#      --build-arg EAP_HTTPS_MODE=keystore   … 8443 を残し、ビルド時に
+#                                              application.keystore を生成する
+#                                              (ファイルが在れば WARN は出ない)
+#      --build-arg EAP_HTTPS_MODE=keep       … 既定のまま (WARN は 31-*.cli で抑制)
+#    を使う。既定は EAP_HTTPS_MODE=remove (= このファイルを適用)。
+#
+#  すべて if で存在チェックしているため、既に外れている構成へ再適用しても
+#  失敗しない (front/back の再ビルドで何度でも通る)。
+#
+#  ★ 依存の向きがあるので削除順を変えないこと
+#    https-listener -> server-ssl-context -> key-manager -> key-store
+#    参照している側から先に消さないと WFLYCTL0367 (capability 参照が残る) になる。
+# =============================================================================
+
+# --- 1. undertow の HTTPS リスナー -------------------------------------------
+if (outcome == success) of /subsystem=undertow/server=default-server/https-listener=https:read-resource
+    echo "[cli] undertow https-listener=https を削除します (TLS 終端は ALB のため未使用)"
+    /subsystem=undertow/server=default-server/https-listener=https:remove
+end-if
+
+# --- 2. elytron: server-ssl-context ------------------------------------------
+if (outcome == success) of /subsystem=elytron/server-ssl-context=applicationSSC:read-resource
+    echo "[cli] elytron server-ssl-context=applicationSSC を削除します"
+    /subsystem=elytron/server-ssl-context=applicationSSC:remove
+end-if
+
+# --- 3. elytron: key-manager (自己署名証明書の自動生成元 = WFLYELY01084) ------
+if (outcome == success) of /subsystem=elytron/key-manager=applicationKM:read-resource
+    echo "[cli] elytron key-manager=applicationKM を削除します (WFLYELY01084 の発生源)"
+    /subsystem=elytron/key-manager=applicationKM:remove
+end-if
+
+# --- 4. elytron: key-store (application.keystore = WFLYELY00023) --------------
+if (outcome == success) of /subsystem=elytron/key-store=applicationKS:read-resource
+    echo "[cli] elytron key-store=applicationKS を削除します (WFLYELY00023 の発生源)"
+    /subsystem=elytron/key-store=applicationKS:remove
+end-if
+
+# --- 5. 使われなくなった socket-binding ---------------------------------------
+#     8443 を listen する主体が居なくなるので併せて外す。残しておいても
+#     害は無いが、「開いていないポートが定義に残る」状態は運用の誤読を招く。
+if (outcome == success) of /socket-binding-group=standard-sockets/socket-binding=https:read-resource
+    echo "[cli] socket-binding=https (8443) を削除します"
+    /socket-binding-group=standard-sockets/socket-binding=https:remove
+end-if

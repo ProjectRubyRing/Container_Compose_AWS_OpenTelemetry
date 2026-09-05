@@ -56,11 +56,16 @@ if [ "${SERVER_SOURCE}" = "zip" ] && [ ! -f vendor/jboss-eap-8.1.0.zip ]; then
     exit 2
 fi
 
+# EAP_HTTPS_MODE (remove | keystore | keep)
+#   既定 (remove) は未使用の HTTPS 一式を standalone.xml から外す。
+#   WFLYELY00023 / WFLYELY01084 の WARN はこれで発生しなくなる。
+#   8443 を残したい場合は EAP_HTTPS_MODE=keystore ./scripts/build.sh
 docker build \
     -f base/Containerfile \
     -t "${BASE_TAG}" \
     --build-arg "SERVER_SOURCE=${SERVER_SOURCE}" \
     ${ADOT_JAVA_AGENT_VERSION:+--build-arg ADOT_JAVA_AGENT_VERSION=${ADOT_JAVA_AGENT_VERSION}} \
+    ${EAP_HTTPS_MODE:+--build-arg EAP_HTTPS_MODE=${EAP_HTTPS_MODE}} \
     .
 
 # -----------------------------------------------------------------------------

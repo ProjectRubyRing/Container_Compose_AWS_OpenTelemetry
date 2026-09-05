@@ -23,6 +23,11 @@
 #    docker build -f base/Containerfile -t app-eap-base:1.0 \
 #      --build-arg SERVER_SOURCE=wildfly .
 #
+#    # 既定 HTTPS (8443) を残す場合 (既定は remove = 未使用の HTTPS 一式を削除し、
+#    # WFLYELY00023 / WFLYELY01084 の WARN を発生させない)
+#    docker build -f base/Containerfile -t app-eap-base:1.0 \
+#      --build-arg EAP_HTTPS_MODE=keystore .
+#
 #    # 社内の EAP ランタイムイメージを土台にする
 #    docker build -f base/Containerfile -t app-eap-base:1.0 \
 #      --build-arg SERVER_SOURCE=image \
@@ -260,14 +265,68 @@ RUN set -eu; \
 #       という環境差を生む。ビルド時に済ませておけば起動時の
 #       ブートストラップが 1 回に戻り、この差自体が消える。
 #       (別プロジェクト Container_ExtraSLB_JVM_https_outbounds と同じ判断)
+#
+#     ---------------------------------------------------------------------
+#     EAP_HTTPS_MODE — 既定 HTTPS (8443) と application.keystore の扱い
+#     ---------------------------------------------------------------------
+#       既定の standalone.xml には https-listener と elytron の
+#       applicationKS / applicationKM / applicationSSC が入っている。
+#       application.keystore はイメージに含まれないため、起動のたびに
+#         WFLYELY00023 KeyStore ファイル ... は存在しません。空白を利用しました
+#         WFLYELY01084 キーストア ... が見つかりません。初回使用時に自己署名
+#                      証明書を使用して自動生成されます
+#       が WARN で出る。TLS 終端は ALB なのでこの HTTPS 一式は使わない。
+#
+#         remove   (既定) 30-elytron-https-remove.cli を適用して HTTPS 一式を
+#                         standalone.xml から外す。WARN は原理的に発生しない。
+#         keystore        HTTPS を残し、application.keystore をビルド時に
+#                         生成しておく。ファイルが在るので WARN は出ない。
+#                         (自己署名。ALB の背後で自己署名を使う構成向け)
+#         keep            既定のまま何もしない。WARN は 31-*.cli の
+#                         filter-spec で抑制される。
+#
+#       いずれのモードでも 31-logging-suppress-known-warnings.cli は適用する
+#       (メッセージ ID 単位の filter-spec = 直接抑制。二重の保険)。
 # -----------------------------------------------------------------------------
-RUN /usr/local/bin/apply-cli.sh \
-      --eap-home "${EAP_HOME}" \
-      --config   "${EAP_CONFIG}" \
-      --cli-dir  "${APP_DIR}/cli" \
-      --pattern  '0*.cli' \
-      --pattern  '1*.cli' \
-      --pattern  '2*.cli'
+ARG EAP_HTTPS_MODE=remove
+#  ★ 既定の "password" は standalone.xml の
+#      <key-store name="applicationKS"><credential-reference clear-text="password"/>
+#    と一致させるための値。EAP 既定の公知パスワードであり秘密ではない
+#    (自己署名のローカル用キーストア。build-arg はイメージ履歴に残る)。
+#    変更する場合は elytron 側の credential-reference も併せて書き換えること。
+ARG EAP_KEYSTORE_PASSWORD=password
+
+RUN set -eu; \
+    set -- --eap-home "${EAP_HOME}" \
+           --config   "${EAP_CONFIG}" \
+           --cli-dir  "${APP_DIR}/cli" \
+           --pattern  '0*.cli' \
+           --pattern  '1*.cli' \
+           --pattern  '2*.cli'; \
+    case "${EAP_HTTPS_MODE}" in \
+      remove) \
+        echo "[build] EAP_HTTPS_MODE=remove: 既定 HTTPS (8443) と elytron のキーストア定義を削除します"; \
+        set -- "$@" --pattern '30*.cli' ;; \
+      keystore) \
+        echo "[build] EAP_HTTPS_MODE=keystore: HTTPS を残し application.keystore を生成します"; \
+        KEYTOOL="$(command -v keytool || true)"; \
+        [ -n "${KEYTOOL}" ] || KEYTOOL="${JAVA_HOME:-/usr/lib/jvm/jre-21}/bin/keytool"; \
+        [ -x "${KEYTOOL}" ] || { echo "ERROR: keytool が見つかりません (${KEYTOOL})" >&2; exit 2; }; \
+        "${KEYTOOL}" -genkeypair -noprompt \
+          -keystore "${EAP_HOME}/standalone/configuration/application.keystore" \
+          -storetype JKS \
+          -storepass "${EAP_KEYSTORE_PASSWORD}" -keypass "${EAP_KEYSTORE_PASSWORD}" \
+          -alias server -keyalg RSA -keysize 2048 -validity 3650 \
+          -dname "CN=localhost, OU=container, O=local, L=local, ST=local, C=JP" \
+          -ext "SAN=dns:localhost,ip:127.0.0.1"; \
+        ls -l "${EAP_HOME}/standalone/configuration/application.keystore" ;; \
+      keep) \
+        echo "[build] EAP_HTTPS_MODE=keep: 既定のまま。WFLYELY00023 / WFLYELY01084 は filter-spec で抑制されます" ;; \
+      *) \
+        echo "ERROR: EAP_HTTPS_MODE は remove | keystore | keep のいずれかです: [${EAP_HTTPS_MODE}]" >&2; exit 2 ;; \
+    esac; \
+    set -- "$@" --pattern '31*.cli'; \
+    /usr/local/bin/apply-cli.sh "$@"
 
 # -----------------------------------------------------------------------------
 #  7. configuration をシードとして退避
