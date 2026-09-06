@@ -41,7 +41,7 @@ base/                     ★ front/back 共通のベースコンテナ
     31-logging-suppress-known-warnings.cli
                                     ★ 既知 WARN を filter-spec で直接抑制
   build/
-    apply-cli.sh            ビルド時に embed-server で CLI を適用
+    apply-cli.sh            ★ ビルド時に embed-server + batch ～ run-batch で CLI を適用
     standalone.conf.append  JAVA_OPTS_APPEND フック
 
 front/  back/             各ロールの Containerfile と固有 CLI
@@ -227,8 +227,64 @@ aws ecs register-task-definition --cli-input-json file://ecs/generated/intra-api
 | EAP 内蔵 opentelemetry サブシステム | Java Agent と二重計装になりスパンが 2 本出る。`10-remove-mp-opentelemetry.cli` で外す |
 | `OTEL_SERVICE_NAME` を必ず明示 | エージェントはデプロイ名から service.name を推測する。明示しないと 4 サービスぶんの front が全部 `front` という 1 ノードに潰れる |
 | CLI はビルド時に適用 | 起動時 `embed-server` は設定ブートストラップを 2 回にし、`standalone_xml_history` の rename が Compose では警告・ECS では起動失敗という環境差を生む |
+| CLI は `batch` ～ `run-batch` で適用 | 1 個の composite になるので「全部入るか、1 つも入らないか」になる。バッチ内では `if` / `echo` が使えないため、`apply-cli.sh` が probe パスでガードを先に解決してから流し込む (下記) |
 | Valkey は Jedis / Lettuce で | `valkey-java` はエージェントの計装対象外。使うとキャッシュアクセスのスパンが一切出ない |
 | コンテキストルートを分ける | front=`/front` / back=`/back`。実 ALB はパスを書き換えず転送するため、両方 `/app` だとパスベースのルールで振り分けられない |
+
+---
+
+## CLI の適用方式 (embed-server + batch)
+
+`base/build/apply-cli.sh` が `.cli` を集めて、**次の形のスクリプトを 1 本生成して流す**。
+
+```
+embed-server --server-config=standalone.xml --std-out=echo
+batch
+    <.cli の操作をすべてここに並べる>
+run-batch
+stop-embedded-server
+```
+
+`batch` ～ `run-batch` は 1 個の composite 操作になるので、
+
+- 全操作が成功したときだけ `standalone.xml` へ書かれる (原子性)
+- 途中で失敗したら全部ロールバックされ、**中途半端な設定のイメージができない**
+- 書き込みが 1 回にまとまる
+
+つまり「ビルドが通った = 設定は全部入った」が保証される。
+
+### なぜ 2 パス構成なのか
+
+JBoss CLI のバッチに積めるのは**操作要求だけ**で、`if` / `else` / `end-if` の制御構文と
+`echo` は入れられない。一方 `.cli` 側は「すべて `if` で冪等化してある」ことが前提の作りで、
+これは捨てられない (`SERVER_SOURCE=image` の社内 EAP イメージや front/back の再適用で、
+リソースが元から在る/無いが変わるため)。
+
+そこで `apply-cli.sh` は CLI 実行を 2 パスに分ける。
+
+| | 何をするか |
+|---|---|
+| パス 1 (probe) | `embed-server` を起動し、`.cli` 中の `if (...) of <アドレス>:read-resource` に出てくるアドレスの**存在有無だけ**を一括で調べる。設定は変えない |
+| パス 2 (apply) | パス 1 の結果で `if` を**ビルド時に**解決し、採用された枝の操作だけを `batch` ～ `run-batch` に並べて流す。`echo` はビルドログ行に振り替える |
+
+**`.cli` ファイルは今までどおり `if` / `echo` 付きで書ける。** 実際にサーバへ渡るスクリプトだけが
+操作の羅列になる。生成されたスクリプトはビルドログに `[apply-cli] | ...` として全文出るので、
+何が流れたかは `docker build` の出力でそのまま確認できる。
+
+> `embed-server` の起動がビルド時に 2 回になるが、これはイメージビルドの中だけの話。
+> 実行時 (`standalone.sh`) のブートは 1 回のままで、CLI をビルド時に適用している理由
+> (`standalone_xml_history` の rename 問題) には影響しない。
+
+### `.cli` を書くときの制約
+
+1. ガードは `if (outcome == success) of <アドレス>:read-resource` と `!=` の 2 形式のみ。入れ子は不可
+2. ガードは batch を流す**前に**まとめて評価される。したがって「同じ run の中で先行する操作が
+   作成/削除したアドレス」をガードの条件に使ってはいけない
+3. `echo` はビルドログに出る。サーバへは渡らない
+4. コメント行と空行はバッチから落とされる (`.cli` が唯一の記述場所)
+
+composite が通らない操作に当たったときの切り分け用に `--no-batch` を用意してある
+(バッチで囲まずに逐次実行する)。通常のビルドでは使わない。
 
 ---
 
