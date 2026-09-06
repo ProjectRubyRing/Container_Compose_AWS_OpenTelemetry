@@ -45,29 +45,21 @@ COPY --chown=${APP_UID}:${APP_GID} ${APP_SOURCE} ${APP_DIR}/${APP_NAME}
 RUN chmod 0444 "${APP_DIR}/${APP_NAME}"
 
 # -----------------------------------------------------------------------------
-#  2. front 固有の JBoss CLI
+#  2. front 固有の JBoss CLI (置くだけ。適用はコンテナ起動時)
 #
 #     - WAR を unmanaged deployment (fs-archive) として standalone.xml に焼く
 #     - front 固有のサブシステム設定 (セッション設定など)
 #
-#     ベース側の共通 CLI は適用済み。ここでは 5*.cli だけを追加適用する。
+#     ★ ビルド時に embed-server は回さない。
+#       entrypoint.sh が起動のたびに、ベース側の共通 CLI に続けて 5*.cli を
+#       作業領域の standalone.xml へ適用する (下の EAP_CLI_ROLE_PATTERNS)。
+#       <fs-archive> が入ったことの確認も起動時に entrypoint.sh が行う。
 # -----------------------------------------------------------------------------
 COPY front/cli/ ${APP_DIR}/cli/
 RUN set -eu; \
     sed -i 's/\r$//' "${APP_DIR}"/cli/5*.cli; \
     chmod 0444 "${APP_DIR}"/cli/5*.cli; \
-    /usr/local/bin/apply-cli.sh \
-        --eap-home "${JBOSS_HOME}" \
-        --config   "${EAP_CONFIG}" \
-        --cli-dir  "${APP_DIR}/cli" \
-        --pattern  '5*.cli'; \
-    rm -rf "${EAP_SEED_DIR}/configuration"; \
-    cp -a "${JBOSS_HOME}/standalone/configuration" "${EAP_SEED_DIR}/configuration"; \
-    chmod -R a+rX "${EAP_SEED_DIR}"; \
-    grep -q 'fs-archive' "${EAP_SEED_DIR}/configuration/${EAP_CONFIG}" \
-      || { echo "ERROR: standalone.xml に <fs-archive> が焼き込まれていません" >&2; exit 3; }; \
-    echo "[build][front] --- 焼き込まれた <deployments> ---"; \
-    sed -n '/<deployments>/,/<\/deployments>/p' "${EAP_SEED_DIR}/configuration/${EAP_CONFIG}"
+    ls -l "${APP_DIR}"/cli/
 
 # -----------------------------------------------------------------------------
 #  3. front の実行時既定値
@@ -75,11 +67,14 @@ RUN set -eu; \
 #     APP_SERVICE (intra-api / intra-web / inter-api / sf-api) は
 #     タスク定義 / compose から与える。ここでは決めない。
 # -----------------------------------------------------------------------------
+#     EAP_CLI_ROLE_PATTERNS が「起動時にどの .cli を追加適用するか」を決める。
+#     entrypoint.sh は 0* -> 1* -> 2* -> (30*) -> 31* の後にこれを流す。
 ENV APP_ROLE=front \
     APP_NAME=${APP_NAME} \
     APP_DEPLOY_PATH=${APP_DIR}/${APP_NAME} \
     HTTP_PORT=${HTTP_PORT} \
     JBOSS_HTTP_PORT=${HTTP_PORT} \
+    EAP_CLI_ROLE_PATTERNS="5*.cli" \
     HEALTHCHECK_CONTEXT=/front \
     HEALTHCHECK_PATH=/api/health
 

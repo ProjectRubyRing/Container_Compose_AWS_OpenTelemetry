@@ -12,6 +12,15 @@
 #    FROM にして、それぞれの WAR と固有設定だけを足す。
 #
 #  ---------------------------------------------------------------------------
+#  ★ JBoss CLI (.cli) はこのイメージでは適用しない
+#  ---------------------------------------------------------------------------
+#    イメージに入れるのは素の standalone.xml (= シード) と .cli ファイル、
+#    そして apply-cli.sh だけ。設定はコンテナ起動時に entrypoint.sh が
+#    作業領域 (EAP_RUN_DIR) の standalone.xml へ適用する。
+#    したがって HTTPS の扱い (EAP_HTTPS_MODE) も build-arg ではなく
+#    実行時の環境変数になっている。
+#
+#  ---------------------------------------------------------------------------
 #  ビルド例
 #  ---------------------------------------------------------------------------
 #    # 本番 (EAP 8.1 の zip を vendor/ に置いておく)
@@ -23,10 +32,10 @@
 #    docker build -f base/Containerfile -t app-eap-base:1.0 \
 #      --build-arg SERVER_SOURCE=wildfly .
 #
-#    # 既定 HTTPS (8443) を残す場合 (既定は remove = 未使用の HTTPS 一式を削除し、
-#    # WFLYELY00023 / WFLYELY01084 の WARN を発生させない)
-#    docker build -f base/Containerfile -t app-eap-base:1.0 \
-#      --build-arg EAP_HTTPS_MODE=keystore .
+#    # 既定 HTTPS (8443) を残す場合は起動時の環境変数で指定する (ビルドし直さない)
+#    #   既定は remove = 未使用の HTTPS 一式を削除し、
+#    #   WFLYELY00023 / WFLYELY01084 の WARN を発生させない
+#    docker run -e EAP_HTTPS_MODE=keystore ...
 #
 #    # 社内の EAP ランタイムイメージを土台にする
 #    docker build -f base/Containerfile -t app-eap-base:1.0 \
@@ -230,14 +239,16 @@ RUN set -eu; \
 # -----------------------------------------------------------------------------
 #  4. 共通シェルと CLI
 #     Windows でチェックアウトした CRLF でも動くよう CR を落としてから使う。
+#
+#     ★ apply-cli.sh も base/bin/ にある (実行時スクリプト)。
+#       entrypoint.sh が起動のたびに呼ぶ。.cli は読むだけなので 0444。
 # -----------------------------------------------------------------------------
 COPY base/bin/  ${APP_BIN_DIR}/
 COPY base/cli/  ${APP_DIR}/cli/
-COPY base/build/apply-cli.sh /usr/local/bin/apply-cli.sh
 
 RUN set -eu; \
-    sed -i 's/\r$//' "${APP_BIN_DIR}"/*.sh "${APP_DIR}"/cli/*.cli /usr/local/bin/apply-cli.sh; \
-    chmod 0755 "${APP_BIN_DIR}"/*.sh /usr/local/bin/apply-cli.sh; \
+    sed -i 's/\r$//' "${APP_BIN_DIR}"/*.sh "${APP_DIR}"/cli/*.cli; \
+    chmod 0755 "${APP_BIN_DIR}"/*.sh; \
     chmod 0444 "${APP_DIR}"/cli/*.cli
 
 # -----------------------------------------------------------------------------
@@ -259,83 +270,38 @@ RUN set -eu; \
     rm -f /tmp/standalone.conf.append
 
 # -----------------------------------------------------------------------------
-#  6. 共通 CLI をビルド時に適用する
+#  6. CLI はイメージに焼かない (起動時に entrypoint.sh が適用する)
 #
-#     ★ 起動時ではなくビルド時に適用する理由
-#       起動時に embed-server を回すと「1 回目の設定ブートストラップ」になり、
-#       続く standalone.sh の本ブートが standalone_xml_history/current の
-#       ディレクトリ rename を試みる。この rename だけはファイルシステムの
-#       実体 (overlayfs か / ボリュームか) に依存し、Compose では警告
-#       (WFLYCTL0414) で済むのに ECS では WFLYCTL0082 でブートが落ちる、
-#       という環境差を生む。ビルド時に済ませておけば起動時の
-#       ブートストラップが 1 回に戻り、この差自体が消える。
-#       (別プロジェクト Container_ExtraSLB_JVM_https_outbounds と同じ判断)
+#     ここでは .cli を配置するだけで、embed-server は一切回さない。
+#     シードの standalone.xml は EAP 既定の素の状態のまま出荷し、
+#     設定はコンテナ起動のたびに作業領域 (EAP_RUN_DIR) 側へ入れる。
 #
-#     ---------------------------------------------------------------------
-#     EAP_HTTPS_MODE — 既定 HTTPS (8443) と application.keystore の扱い
-#     ---------------------------------------------------------------------
-#       既定の standalone.xml には https-listener と elytron の
-#       applicationKS / applicationKM / applicationSSC が入っている。
-#       application.keystore はイメージに含まれないため、起動のたびに
-#         WFLYELY00023 KeyStore ファイル ... は存在しません。空白を利用しました
-#         WFLYELY01084 キーストア ... が見つかりません。初回使用時に自己署名
-#                      証明書を使用して自動生成されます
-#       が WARN で出る。TLS 終端は ALB なのでこの HTTPS 一式は使わない。
+#     ★ 何が変わるか
+#       - 同じイメージのまま、起動時の環境変数で構成を変えられる
+#         (EAP_HTTPS_MODE / EAP_CLI_PATTERNS)。ビルドし直しが要らない。
+#       - front / back のビルドは「WAR を置くだけ」になる。
+#       - 代償として、コンテナの起動が embed-server 2 回ぶん遅くなる。
 #
-#         remove   (既定) 30-elytron-https-remove.cli を適用して HTTPS 一式を
-#                         standalone.xml から外す。WARN は原理的に発生しない。
-#         keystore        HTTPS を残し、application.keystore をビルド時に
-#                         生成しておく。ファイルが在るので WARN は出ない。
-#                         (自己署名。ALB の背後で自己署名を使う構成向け)
-#         keep            既定のまま何もしない。WARN は 31-*.cli の
-#                         filter-spec で抑制される。
+#     ★ standalone_xml_history の rename 問題はどうなるのか
+#       起動時に embed-server を回すと configuration/standalone_xml_history が
+#       でき、続く standalone.sh の本ブートが current の rename を試みる。
+#       この rename はファイルシステムの実体に依存し、履歴がイメージ
+#       (overlayfs の下位レイヤ) に在ると Compose では警告 (WFLYCTL0414)、
+#       ECS では WFLYCTL0082 でブート失敗、という環境差になる。
+#       起動時適用ではこの履歴が
+#         - overlayfs ではなく作業領域 (compose=tmpfs / ECS=volume) にでき、
+#         - apply-cli.sh が適用直後に消す
+#       ため、本ブートは「履歴の無い状態からの初回」になり rename 自体が
+#       発生しない。詳細は base/bin/entrypoint.sh の 5. を参照。
 #
-#       いずれのモードでも 31-logging-suppress-known-warnings.cli は適用する
-#       (メッセージ ID 単位の filter-spec = 直接抑制。二重の保険)。
+#     ★ 適用対象と HTTPS の扱い (EAP_HTTPS_MODE) は実行時 ENV。下の 8. を参照。
 # -----------------------------------------------------------------------------
-ARG EAP_HTTPS_MODE=remove
-#  ★ 既定の "password" は standalone.xml の
-#      <key-store name="applicationKS"><credential-reference clear-text="password"/>
-#    と一致させるための値。EAP 既定の公知パスワードであり秘密ではない
-#    (自己署名のローカル用キーストア。build-arg はイメージ履歴に残る)。
-#    変更する場合は elytron 側の credential-reference も併せて書き換えること。
-ARG EAP_KEYSTORE_PASSWORD=password
-
-RUN set -eu; \
-    set -- --eap-home "${EAP_HOME}" \
-           --config   "${EAP_CONFIG}" \
-           --cli-dir  "${APP_DIR}/cli" \
-           --pattern  '0*.cli' \
-           --pattern  '1*.cli' \
-           --pattern  '2*.cli'; \
-    case "${EAP_HTTPS_MODE}" in \
-      remove) \
-        echo "[build] EAP_HTTPS_MODE=remove: 既定 HTTPS (8443) と elytron のキーストア定義を削除します"; \
-        set -- "$@" --pattern '30*.cli' ;; \
-      keystore) \
-        echo "[build] EAP_HTTPS_MODE=keystore: HTTPS を残し application.keystore を生成します"; \
-        KEYTOOL="$(command -v keytool || true)"; \
-        [ -n "${KEYTOOL}" ] || KEYTOOL="${JAVA_HOME:-/usr/lib/jvm/jre-21}/bin/keytool"; \
-        [ -x "${KEYTOOL}" ] || { echo "ERROR: keytool が見つかりません (${KEYTOOL})" >&2; exit 2; }; \
-        "${KEYTOOL}" -genkeypair -noprompt \
-          -keystore "${EAP_HOME}/standalone/configuration/application.keystore" \
-          -storetype JKS \
-          -storepass "${EAP_KEYSTORE_PASSWORD}" -keypass "${EAP_KEYSTORE_PASSWORD}" \
-          -alias server -keyalg RSA -keysize 2048 -validity 3650 \
-          -dname "CN=localhost, OU=container, O=local, L=local, ST=local, C=JP" \
-          -ext "SAN=dns:localhost,ip:127.0.0.1"; \
-        ls -l "${EAP_HOME}/standalone/configuration/application.keystore" ;; \
-      keep) \
-        echo "[build] EAP_HTTPS_MODE=keep: 既定のまま。WFLYELY00023 / WFLYELY01084 は filter-spec で抑制されます" ;; \
-      *) \
-        echo "ERROR: EAP_HTTPS_MODE は remove | keystore | keep のいずれかです: [${EAP_HTTPS_MODE}]" >&2; exit 2 ;; \
-    esac; \
-    set -- "$@" --pattern '31*.cli'; \
-    /usr/local/bin/apply-cli.sh "$@"
 
 # -----------------------------------------------------------------------------
 #  7. configuration をシードとして退避
-#     実行時は entrypoint.sh が EAP_RUN_DIR/configuration へ複製する。
+#     実行時は entrypoint.sh が EAP_RUN_DIR/configuration へ複製し、
+#     その複製に対して CLI を適用する。ここで退避するのは EAP 既定の
+#     素の standalone.xml であって、設定済みのものではない。
 # -----------------------------------------------------------------------------
 RUN set -eu; \
     rm -rf "${EAP_HOME}/standalone/configuration/standalone_xml_history"; \
@@ -347,7 +313,7 @@ RUN set -eu; \
     printf '%s\n' \
       'このディレクトリは実行時には使いません。' \
       'jboss.server.base.dir は entrypoint.sh により EAP_RUN_DIR へ向けられます。' \
-      'front/back のビルドで embed-server を再実行するため、空のまま残しています。' \
+      'CLI もこちらではなく作業領域側の複製に適用されます。' \
       > "${EAP_HOME}/standalone/README-container.txt"; \
     mkdir -p "${EAP_RUN_DIR}" "${APP_DIR}"; \
     chown "${APP_UID}:${APP_GID}" "${EAP_RUN_DIR}"; \
@@ -360,6 +326,19 @@ RUN set -eu; \
 #     ここに OTEL_* を書かないのが本構成の方針。OTEL_* は otel-env.sh が
 #     APP_SERVICE / APP_ROLE から導出する。イメージに焼くと環境ごとに
 #     イメージが分かれてしまう。
+#
+#     --- CLI の適用 (起動時) ---------------------------------------------
+#       EAP_CLI_ENABLED        false でCLI 適用を止め、シードのまま起動する
+#       EAP_CLI_DIR            .cli の置き場
+#       EAP_CLI_STDOUT         apply パスの embed-server ブートログ
+#                              (echo=出す / discard=捨てる)
+#       EAP_HTTPS_MODE         remove (既定) / keystore / keep
+#                              既定 HTTPS (8443) と application.keystore の扱い。
+#                              旧構成では build-arg だったが、CLI が起動時適用に
+#                              なったので実行時の環境変数になっている。
+#       EAP_CLI_ROLE_PATTERNS  ロール固有 .cli のパターン (front/back が設定)
+#       EAP_CLI_PATTERNS       (未設定) 指定するとパターンの導出を丸ごと置換
+#       EAP_KEYSTORE_PASSWORD  (未設定 = password) keystore モードのときだけ使用
 # -----------------------------------------------------------------------------
 ENV JBOSS_HOME=${EAP_HOME} \
     EAP_RUN_DIR=${EAP_RUN_DIR} \
@@ -367,6 +346,10 @@ ENV JBOSS_HOME=${EAP_HOME} \
     EAP_CONFIG=${EAP_CONFIG} \
     EAP_CONFIG_SEED=always \
     EAP_TMP_DIR=${EAP_RUN_DIR}/tmp \
+    EAP_CLI_ENABLED=true \
+    EAP_CLI_DIR=${APP_DIR}/cli \
+    EAP_CLI_STDOUT=echo \
+    EAP_HTTPS_MODE=remove \
     APP_DIR=${APP_DIR} \
     APP_BIN_DIR=${APP_BIN_DIR} \
     APP_UID=${APP_UID} \

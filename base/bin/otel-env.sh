@@ -430,26 +430,167 @@ export OTEL_JAVAAGENT_LOGGING
 : "${OTEL_AGENT_LOG_SUPPRESS:=true}"
 : "${OTEL_AGENT_LOG_SUPPRESS_SPEC:=software.amazon.opentelemetry.javaagent.instrumentation.serviceevents=error,io.opentelemetry.javaagent.shaded.instrumentation.api.incubator.config.internal.DbConfig=error}"
 
+#    ★ SPEC を上書きすると上の 2 件が消える。既定を残したまま足したいときは
+#      OTEL_AGENT_LOG_SUPPRESS_EXTRA を使う (書式は SPEC と同じ)。
+: "${OTEL_AGENT_LOG_SUPPRESS_EXTRA:=}"
+
+# --- トレース関連 WARN のグループ抑制 -----------------------------------------
+#
+#  ★ ロガー名を覚えなくても、原因の種類ごとに 1 語で止められるようにする。
+#
+#    トレースまわりの WARN は「出どころ」で性質がはっきり分かれる。
+#    ロガー名を直接書かせると版が上がるたびに追随が必要になるので、
+#    グループ名 -> ロガー名の対応をこのファイルが持ち、利用側は
+#    OTEL_TRACE_WARN_SUPPRESS にグループ名を並べるだけにする。
+#
+#      グループ    止まる WARN                              既定
+#      ----------- ---------------------------------------- ------
+#      resource    EC2 / ECS / EKS のメタデータが引けない    ON
+#                  (Compose には 169.254.170.2 が無いので
+#                   毎起動必ず出る。取れなくてもトレースは
+#                   出る = 資源属性が少し減るだけ)
+#      context     Scope.close の呼び忘れ / Context 不整合   ON
+#                  (EAP の非同期処理で出る。アプリ側では
+#                   直せず、リクエストごとに繰り返し出る)
+#      export      Collector へ送れない (接続拒否 / 5xx)     OFF
+#                  ★ 既定で消さない。「X-Ray に出ない」の
+#                    最初の手掛かりがこれ。起動直後だけの
+#                    ノイズなら OTEL_WAIT_FOR_COLLECTOR=true
+#                    (entrypoint.sh の 7.) で待ってから
+#                    起動する方が筋がよい
+#      sampler     X-Ray 集中サンプリングのルール取得失敗    OFF
+#                  ★ 既定で消さない。サンプリングが既定値の
+#                    ままになっている = 意図した比率で
+#                    採れていない、という重要な事実
+#      muzzle      計装の適用失敗 (muzzle / tooling)         OFF
+#                  ★ 既定で消さない。特定の計装だけスパンが
+#                    出ない原因がここに出る
+#
+#    値: グループ名のカンマ区切り / all (全グループ) / off (何もしない)
+#    例: OTEL_TRACE_WARN_SUPPRESS=resource,context,export
+#
+#    ★ 消す前に「なぜ出ているか」を一度は読むこと。原因が分からない WARN を
+#      消すと、後日の障害調査で最初の手掛かりを失う
+#      (base/cli/31-logging-suppress-known-warnings.cli と同じ方針)。
+: "${OTEL_TRACE_WARN_SUPPRESS:=resource,context}"
+
+#    グループに適用するレベル。error = WARN 以下が消えて ERROR は残る。
+#    off にすると ERROR まで消える (常用しないこと)。
+: "${OTEL_TRACE_WARN_SUPPRESS_LEVEL:=error}"
+
+#    ロガー名 (グループが持つもの / SPEC / EXTRA いずれも) について、
+#    エージェント JAR 内での再配置後の名前も併せて設定するか。
+#      false にすると書いた名前だけを設定する。
+: "${OTEL_AGENT_LOG_SHADED_ALIAS:=true}"
+
+#  グループ名 -> ロガー名 (空白区切り)。未知の名前なら 1 を返す。
+otel_trace_warn_group_loggers() {
+    case "$1" in
+        resource)
+            echo "io.opentelemetry.contrib.aws.resource io.opentelemetry.instrumentation.resources io.opentelemetry.sdk.autoconfigure.ResourceConfiguration" ;;
+        context)
+            echo "io.opentelemetry.context" ;;
+        export)
+            echo "io.opentelemetry.exporter io.opentelemetry.sdk.internal.ThrottlingLogger io.opentelemetry.sdk.trace.export" ;;
+        sampler)
+            echo "io.opentelemetry.contrib.awsxray" ;;
+        muzzle)
+            echo "io.opentelemetry.javaagent.tooling" ;;
+        *)  return 1 ;;
+    esac
+}
+
+#  エージェント JAR 内での再配置後 (シェーディング後) のロガー名を返す。
+#
+#  ★ OpenTelemetry Java Agent は同梱する SDK / API / 計装ライブラリを
+#    別パッケージへ移してからシェーディングする。ロガー名 = クラスの
+#    完全修飾名なので、公式ドキュメントに出てくる名前をそのまま書いても
+#    実行時のロガー名とは一致しない。再配置の規則は 2 通り:
+#
+#      io.opentelemetry.instrumentation.**
+#          -> io.opentelemetry.javaagent.shaded.instrumentation.**
+#      io.opentelemetry.{api,context,sdk,exporter,contrib}.**
+#          -> io.opentelemetry.javaagent.shaded.io.opentelemetry.**
+#
+#    (既定 SPEC の DbConfig が ...shaded.instrumentation.api... なのは前者)
+#    io.opentelemetry.javaagent.** はエージェント自身のコードで移動しない。
+#    software.amazon.** (ADOT 固有) も移動しない。
+otel_shaded_alias() {
+    case "$1" in
+        io.opentelemetry.javaagent.*)
+            echo "" ;;
+        io.opentelemetry.instrumentation.*)
+            echo "io.opentelemetry.javaagent.shaded.instrumentation.${1#io.opentelemetry.instrumentation.}" ;;
+        io.opentelemetry.*)
+            echo "io.opentelemetry.javaagent.shaded.$1" ;;
+        *)
+            echo "" ;;
+    esac
+}
+
 #    ※ OTEL_JAVAAGENT_LOGGING=application のときはエージェントのログが
 #      JBoss の logging サブシステムを通るため、この system property は効かない。
 #      その場合は base/cli/31-logging-suppress-known-warnings.cli 側の
 #      filter-spec に条件を足して止めること。
+#  実際に流す抑制リストを組み立てる。
+#    SPEC (既定 2 件 / 上書き可) + グループ展開 + EXTRA
+_agent_log_suppress_spec="${OTEL_AGENT_LOG_SUPPRESS_SPEC}"
+_trace_warn_groups=""
+
+if [ -n "${OTEL_TRACE_WARN_SUPPRESS}" ] && [ "${OTEL_TRACE_WARN_SUPPRESS}" != "off" ]; then
+    if [ "${OTEL_TRACE_WARN_SUPPRESS}" = "all" ]; then
+        _tw_list="resource context export sampler muzzle"
+    else
+        _tw_list="$(echo "${OTEL_TRACE_WARN_SUPPRESS}" | tr ',' ' ')"
+    fi
+    for _tw_group in ${_tw_list}; do
+        _tw_loggers="$(otel_trace_warn_group_loggers "${_tw_group}")" \
+            || otel_die "OTEL_TRACE_WARN_SUPPRESS に未知のグループ名があります: [${_tw_group}] / 指定できるのは resource, context, export, sampler, muzzle, all, off です。個別のロガー名を止めたい場合は OTEL_AGENT_LOG_SUPPRESS_EXTRA を使ってください。" 44
+        for _tw_logger in ${_tw_loggers}; do
+            _agent_log_suppress_spec="${_agent_log_suppress_spec},${_tw_logger}=${OTEL_TRACE_WARN_SUPPRESS_LEVEL}"
+        done
+        _trace_warn_groups="${_trace_warn_groups}${_trace_warn_groups:+,}${_tw_group}"
+    done
+    unset _tw_list _tw_group _tw_loggers _tw_logger
+else
+    _trace_warn_groups="off"
+fi
+
+if [ -n "${OTEL_AGENT_LOG_SUPPRESS_EXTRA}" ]; then
+    _agent_log_suppress_spec="${_agent_log_suppress_spec},${OTEL_AGENT_LOG_SUPPRESS_EXTRA}"
+fi
+
 _agent_log_suppress_state="off"
+_agent_log_suppress_count=0
 if [ "${OTEL_AGENT_LOG_SUPPRESS}" = "true" ]; then
     if [ "${OTEL_JAVAAGENT_LOGGING}" = "simple" ]; then
         # ロガー名・レベルに空白は入らないので、カンマを空白に変えて分割する。
-        for _sup in $(echo "${OTEL_AGENT_LOG_SUPPRESS_SPEC}" | tr ',' ' '); do
+        for _sup in $(echo "${_agent_log_suppress_spec}" | tr ',' ' '); do
             _sup_logger="${_sup%%=*}"
             _sup_level="${_sup#*=}"
             [ -n "${_sup_logger}" ] || continue
             [ "${_sup_level}" != "${_sup}" ] || _sup_level="error"
             JAVA_OPTS_APPEND="${JAVA_OPTS_APPEND:-} -Dio.opentelemetry.javaagent.slf4j.simpleLogger.log.${_sup_logger}=${_sup_level}"
+            _agent_log_suppress_count=$((_agent_log_suppress_count + 1))
+            # 再配置後の名前にも同じレベルを設定する (どちらで出ても止まる)。
+            if [ "${OTEL_AGENT_LOG_SHADED_ALIAS}" = "true" ]; then
+                _sup_alias="$(otel_shaded_alias "${_sup_logger}")"
+                if [ -n "${_sup_alias}" ]; then
+                    JAVA_OPTS_APPEND="${JAVA_OPTS_APPEND} -Dio.opentelemetry.javaagent.slf4j.simpleLogger.log.${_sup_alias}=${_sup_level}"
+                    _agent_log_suppress_count=$((_agent_log_suppress_count + 1))
+                fi
+            fi
         done
         export JAVA_OPTS_APPEND
-        unset _sup _sup_logger _sup_level
+        unset _sup _sup_logger _sup_level _sup_alias
         _agent_log_suppress_state="on"
     else
+        #  ★ application モードではエージェントのログが JBoss の logging
+        #    サブシステムを通るため、この system property は一切効かない。
+        #    その場合は base/cli/31-logging-suppress-known-warnings.cli の
+        #    filter-spec 側で止めること。
         _agent_log_suppress_state="skipped (OTEL_JAVAAGENT_LOGGING=${OTEL_JAVAAGENT_LOGGING})"
+        otel_warn "OTEL_JAVAAGENT_LOGGING=${OTEL_JAVAAGENT_LOGGING} のためエージェントログの抑制は効きません (simple のときだけ有効)。JBoss の logging サブシステム側 (31-logging-suppress-known-warnings.cli の filter-spec) で止めてください。"
     fi
 fi
 
@@ -520,7 +661,9 @@ otel_print_summary() {
     otel_log "  peer-service-mapping             = ${OTEL_INSTRUMENTATION_COMMON_PEER_SERVICE_MAPPING:-(なし)}"
     otel_log "  service-events (function 計装)   = ${OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED} packages=${OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE:-(なし)}"
     otel_log "  db query sanitization            = ${OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED}"
-    otel_log "  agent log suppress               = ${_agent_log_suppress_state} [${OTEL_AGENT_LOG_SUPPRESS_SPEC}]"
+    otel_log "  agent log suppress               = ${_agent_log_suppress_state} (-D ${_agent_log_suppress_count} 件)"
+    otel_log "  trace WARN suppress (group)      = ${_trace_warn_groups} [level=${OTEL_TRACE_WARN_SUPPRESS_LEVEL}]"
+    otel_log "  suppressed loggers               = ${_agent_log_suppress_spec}"
     otel_log "  JBOSS_MODULES_SYSTEM_PKGS        = ${JBOSS_MODULES_SYSTEM_PKGS}"
     otel_log "  JAVA_OPTS_APPEND                 = ${JAVA_OPTS_APPEND:-(なし)}"
     otel_log "----------------------------------------------------------"

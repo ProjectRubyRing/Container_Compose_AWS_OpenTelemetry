@@ -29,6 +29,7 @@ base/                     ★ front/back 共通のベースコンテナ
   Containerfile             UBI9.8 + OpenJDK21 + EAP8.1 + ADOT Agent
   bin/
     entrypoint.sh           起動処理 (共通)
+    apply-cli.sh            ★ 起動時に embed-server + batch ～ run-batch で CLI を適用
     jvm-env.sh              ★ JVM 環境変数の共通シェル (JAVA_OPTS_APPEND 版 / 既定)
     jvm-env-javaopts.sh     ★ 同上 (JAVA_OPTS 版。既定値を全部自前で持つ)
     otel-env.sh             ★ OpenTelemetry 環境変数の共通シェル (命名規約の実体)
@@ -41,10 +42,9 @@ base/                     ★ front/back 共通のベースコンテナ
     31-logging-suppress-known-warnings.cli
                                     ★ 既知 WARN を filter-spec で直接抑制
   build/
-    apply-cli.sh            ★ ビルド時に embed-server + batch ～ run-batch で CLI を適用
     standalone.conf.append  JAVA_OPTS_APPEND フック
 
-front/  back/             各ロールの Containerfile と固有 CLI
+front/  back/             各ロールの Containerfile と固有 CLI (適用は起動時)
 sample-app/               全経路を叩く検証用 WAR (実 WAR に差し替え可)
 
 otel/
@@ -226,16 +226,19 @@ aws ecs register-task-definition --cli-input-json file://ecs/generated/intra-api
 | `JBOSS_MODULES_SYSTEM_PKGS` | `io.opentelemetry.javaagent` を追加必須。無いとクラスローダ隔離で `NoClassDefFoundError` |
 | EAP 内蔵 opentelemetry サブシステム | Java Agent と二重計装になりスパンが 2 本出る。`10-remove-mp-opentelemetry.cli` で外す |
 | `OTEL_SERVICE_NAME` を必ず明示 | エージェントはデプロイ名から service.name を推測する。明示しないと 4 サービスぶんの front が全部 `front` という 1 ノードに潰れる |
-| CLI はビルド時に適用 | 起動時 `embed-server` は設定ブートストラップを 2 回にし、`standalone_xml_history` の rename が Compose では警告・ECS では起動失敗という環境差を生む |
+| トレース関連 WARN は `filter-spec` では止まらない | エージェントのログは `OTEL_JAVAAGENT_LOGGING=simple`（既定）では JBoss の logging サブシステムを通らず stderr へ直接書かれる。抑制は JVM のシステムプロパティ＝`OTEL_TRACE_WARN_SUPPRESS`（グループ）で行う |
+| CLI はコンテナ起動時に適用 | イメージが持つのは素の `standalone.xml` と `.cli` だけ。`entrypoint.sh` が作業領域 (`/run/eap`) の複製へ適用するので、構成の変更に再ビルドが要らない。代償は起動が `embed-server` 2 回ぶん遅くなること |
+| `standalone_xml_history` は適用直後に消す | 残っていると続く `standalone.sh` の本ブートが `current` の rename を試みる。この rename はファイルシステム依存で、履歴がイメージ (overlayfs) 側に在ると Compose では警告 (WFLYCTL0414) / ECS では起動失敗 (WFLYCTL0082) という環境差になる。作業領域に作って即消せば「履歴の無い初回ブート」になり発生しない |
 | CLI は `batch` ～ `run-batch` で適用 | 1 個の composite になるので「全部入るか、1 つも入らないか」になる。バッチ内では `if` / `echo` が使えないため、`apply-cli.sh` が probe パスでガードを先に解決してから流し込む (下記) |
+| CLI の JVM に `JAVA_OPTS` を渡さない | 起動時に走る以上、アプリ用の `JAVA_OPTS` (`full` では `-javaagent` を含む) を継ぐと `jboss-cli.sh` まで計装される。`apply-cli.sh` が CLI 用の `JAVA_OPTS` を組み立て直し、`JAVA_TOOL_OPTIONS` も落とす |
 | Valkey は Jedis / Lettuce で | `valkey-java` はエージェントの計装対象外。使うとキャッシュアクセスのスパンが一切出ない |
 | コンテキストルートを分ける | front=`/front` / back=`/back`。実 ALB はパスを書き換えず転送するため、両方 `/app` だとパスベースのルールで振り分けられない |
 
 ---
 
-## CLI の適用方式 (embed-server + batch)
+## CLI の適用方式 (起動時 / embed-server + batch)
 
-`base/build/apply-cli.sh` が `.cli` を集めて、**次の形のスクリプトを 1 本生成して流す**。
+`base/bin/apply-cli.sh` が `.cli` を集めて、**次の形のスクリプトを 1 本生成して流す**。
 
 ```
 embed-server --server-config=standalone.xml --std-out=echo
@@ -248,10 +251,44 @@ stop-embedded-server
 `batch` ～ `run-batch` は 1 個の composite 操作になるので、
 
 - 全操作が成功したときだけ `standalone.xml` へ書かれる (原子性)
-- 途中で失敗したら全部ロールバックされ、**中途半端な設定のイメージができない**
+- 途中で失敗したら全部ロールバックされ、**中途半端な設定のサーバが起動しない**
 - 書き込みが 1 回にまとまる
 
-つまり「ビルドが通った = 設定は全部入った」が保証される。
+つまり「CLI が通った = 設定は全部入った」が保証される。失敗すれば `entrypoint.sh` が
+そこで停止し、コンテナは起動してこない。
+
+### いつ走るのか
+
+コンテナ起動のたび、`entrypoint.sh` の 5. で走る。
+
+```
+1. root 起動時のみ権限降格
+2. 作業領域 /run/eap を用意
+3. configuration をイメージ内シードから複製
+4. WAR (archive) の実体を検証
+5. ★ CLI を適用 (apply-cli.sh)        ← ここ
+6. jvm-env*.sh -> otel-env.sh
+7. ADOT サイドカーの待ち合わせ (任意)
+8. standalone.sh を exec
+```
+
+イメージに焼かれているのは **EAP 既定の素の `standalone.xml` (シード) と `.cli` だけ**で、
+設定は入っていない。3. で作業領域へ複製したものに対して 5. が適用する
+(`EAP_CONFIG_SEED=always` が既定なので、毎起動シードからやり直す)。
+
+| | |
+|---|---|
+| 適用順 | `0*` → `1*` → `2*` → (`30*`) → `31*` → ロール固有 (`5*`=front / `6*`=back) |
+| `30*` の有無 | `EAP_HTTPS_MODE` で決まる (`remove`=適用 / `keystore`・`keep`=適用しない) |
+| ロール固有 | `EAP_CLI_ROLE_PATTERNS` (front/back の Containerfile が `ENV` で設定) |
+| 丸ごと差し替え | `EAP_CLI_PATTERNS` に空白区切りで指定すると上の導出を置き換える |
+| 止める | `EAP_CLI_ENABLED=false` (シードのまま起動。切り分け用) |
+| ログ | `EAP_CLI_STDOUT=discard` で適用時の `embed-server` ブートログを捨てる |
+
+**ビルド時に適用しない理由**は、同じイメージのまま起動時の環境変数で構成を変えられること
+(`EAP_HTTPS_MODE` の再ビルドが要らない)、front/back のビルドが「WAR を置くだけ」になること。
+代償として、コンテナの起動が `embed-server` 2 回ぶん (数十秒) 遅くなる。
+ヘルスチェックの `start_period` / `startPeriod` (120s / 180s) はこれを織り込んである。
 
 ### なぜ 2 パス構成なのか
 
@@ -265,26 +302,26 @@ JBoss CLI のバッチに積めるのは**操作要求だけ**で、`if` / `else
 | | 何をするか |
 |---|---|
 | パス 1 (probe) | `embed-server` を起動し、`.cli` 中の `if (...) of <アドレス>:read-resource` に出てくるアドレスの**存在有無だけ**を一括で調べる。設定は変えない |
-| パス 2 (apply) | パス 1 の結果で `if` を**ビルド時に**解決し、採用された枝の操作だけを `batch` ～ `run-batch` に並べて流す。`echo` はビルドログ行に振り替える |
+| パス 2 (apply) | パス 1 の結果で `if` を**CLI へ渡す前に**解決し、採用された枝の操作だけを `batch` ～ `run-batch` に並べて流す。`echo` は `[apply-cli]` のログ行に振り替える |
 
 **`.cli` ファイルは今までどおり `if` / `echo` 付きで書ける。** 実際にサーバへ渡るスクリプトだけが
-操作の羅列になる。生成されたスクリプトはビルドログに `[apply-cli] | ...` として全文出るので、
-何が流れたかは `docker build` の出力でそのまま確認できる。
+操作の羅列になる。生成されたスクリプトは `[apply-cli] | ...` として全文が出るので、
+何が流れたかは `docker compose logs front` でそのまま確認できる。
 
-> `embed-server` の起動がビルド時に 2 回になるが、これはイメージビルドの中だけの話。
-> 実行時 (`standalone.sh`) のブートは 1 回のままで、CLI をビルド時に適用している理由
-> (`standalone_xml_history` の rename 問題) には影響しない。
+> `embed-server` の起動が 2 回になり、そのぶんコンテナの起動が遅くなる。
+> probe パスは `--std-out=discard` でブートログを捨てているぶん apply パスより速い。
+> `standalone.sh` の本ブートは従来どおり 1 回のまま。
 
 ### `.cli` を書くときの制約
 
 1. ガードは `if (outcome == success) of <アドレス>:read-resource` と `!=` の 2 形式のみ。入れ子は不可
 2. ガードは batch を流す**前に**まとめて評価される。したがって「同じ run の中で先行する操作が
    作成/削除したアドレス」をガードの条件に使ってはいけない
-3. `echo` はビルドログに出る。サーバへは渡らない
+3. `echo` は `[apply-cli]` のログ行に出る。サーバへは渡らない
 4. コメント行と空行はバッチから落とされる (`.cli` が唯一の記述場所)
 
 composite が通らない操作に当たったときの切り分け用に `--no-batch` を用意してある
-(バッチで囲まずに逐次実行する)。通常のビルドでは使わない。
+(バッチで囲まずに逐次実行する)。通常の起動では使わない。
 
 ---
 
@@ -378,6 +415,51 @@ Compose で切り替える場合:
 | `WFLYELY00023: KeyStore ファイル '.../application.keystore' は存在しません。空白を利用しました` | `org.wildfly.extension.elytron` | `30-elytron-https-remove.cli` が未使用の `https-listener` / `applicationSSC` / `applicationKM` / `applicationKS` / `socket-binding=https` を削除 | `31-logging-suppress-known-warnings.cli` の `filter-spec` |
 | `WFLYELY01084: キーストア ... が見つかりません。初回使用時に自己署名証明書を使用して自動生成されます` | `org.wildfly.extension.elytron` | 同上 | 同上 |
 
+### トレース関連 WARN のグループ抑制
+
+上の 2 件のようにピンポイントで分かっているものと違い、トレースまわりの WARN は
+**版が上がるたびにロガー名が変わる**。名前を追いかけずに済むよう、`otel-env.sh` が
+「原因の種類」→ ロガー名の対応を持っていて、`OTEL_TRACE_WARN_SUPPRESS` に
+**グループ名を並べるだけ**で止められる。
+
+| グループ | 止まる WARN | 既定 | 既定をそうしている理由 |
+|---|---|---|---|
+| `resource` | EC2 / ECS / EKS のメタデータが引けない | **ON** | Compose には `169.254.170.2` が無いので毎起動必ず出る。取れなくてもトレースは出る（資源属性が少し減るだけ） |
+| `context` | `Scope.close` の呼び忘れ / Context 不整合 | **ON** | EAP の非同期処理で出る。アプリ側では直せず、リクエストごとに繰り返し出る |
+| `export` | Collector へ送れない（接続拒否 / 5xx） | OFF | **「X-Ray に出ない」の最初の手掛かり**。起動直後だけのノイズなら `OTEL_WAIT_FOR_COLLECTOR=true` で待ってから起動する方が筋がよい |
+| `sampler` | X-Ray 集中サンプリングのルール取得失敗 | OFF | サンプリングが既定値のまま = **意図した比率で採れていない**、という重要な事実 |
+| `muzzle` | 計装の適用失敗（muzzle / tooling） | OFF | 特定の計装だけスパンが出ない原因がここに出る |
+
+```yaml
+    environment:
+      OTEL_TRACE_WARN_SUPPRESS: resource,context,export   # 追加で export も黙らせる
+      OTEL_TRACE_WARN_SUPPRESS: all                       # 全グループ
+      OTEL_TRACE_WARN_SUPPRESS: off                       # グループ抑制を使わない
+```
+
+グループに無いロガーは `OTEL_AGENT_LOG_SUPPRESS_EXTRA` で名指しする
+（既定の 2 件を残したまま足せる。`OTEL_AGENT_LOG_SUPPRESS_SPEC` を直接書くと既定が消える）。
+
+```yaml
+      OTEL_AGENT_LOG_SUPPRESS_EXTRA: "com.example.noisy=off,io.opentelemetry.sdk.trace=error"
+```
+
+何が効いたかは起動ログに全部出る。
+
+```
+[otel-env]   agent log suppress               = on (-D 10 件)
+[otel-env]   trace WARN suppress (group)      = resource,context [level=error]
+[otel-env]   suppressed loggers               = software.amazon...serviceevents=error,...
+```
+
+> **ロガー名を自分で書くときの注意。** エージェントは同梱する SDK / 計装ライブラリを
+> 別パッケージへ再配置（シェーディング）するため、公式ドキュメントのクラス名を
+> そのまま書いても実行時のロガー名と一致しない。`otel-env.sh` は
+> `io.opentelemetry.instrumentation.**` → `io.opentelemetry.javaagent.shaded.instrumentation.**`、
+> `io.opentelemetry.{api,context,sdk,exporter,contrib}.**` → `io.opentelemetry.javaagent.shaded.io.opentelemetry.**`
+> の 2 規則で**再配置後の名前にも同じレベルを自動で付ける**ので、どちらの名前で書いても効く
+> （`OTEL_AGENT_LOG_SHADED_ALIAS=false` で無効化）。
+
 ### なぜ 2 系統あるのか
 
 - **A だけでは足りない場面がある。** `SERVER_SOURCE=image`（社内の EAP ランタイムイメージ）では既定の
@@ -402,16 +484,23 @@ Compose で切り替える場合:
 | 変数 | 既定 | 用途 |
 |---|---|---|
 | `APP_SERVICE_EVENT_PACKAGES` | 空 | ADOT の関数レベル計装を**使う**場合の対象パッケージ（例 `com.example.app`）。指定すると `..._FUNCTION_INSTRUMENT_ENABLED=true` が自動で付く。★スパン数＝X-Ray 課金が跳ねるので必ず絞る |
-| `OTEL_AGENT_LOG_SUPPRESS` | `true` | エージェントログの直接抑制の ON/OFF。`false` にすると本来の WARN が見える |
-| `OTEL_AGENT_LOG_SUPPRESS_SPEC` | 上表の 2 件 | `<ロガー名>=<レベル>,...`。レベル省略時は `error`。ロガー名はパッケージ単位でも可 |
+| `OTEL_AGENT_LOG_SUPPRESS` | `true` | エージェントログの直接抑制の ON/OFF。`false` にすると本来の WARN が見える（グループ抑制も止まる） |
+| `OTEL_TRACE_WARN_SUPPRESS` | `resource,context` | トレース関連 WARN のグループ抑制。`resource` / `context` / `export` / `sampler` / `muzzle` のカンマ区切り、`all`、`off`。未知のグループ名は起動時にエラー（exit 44） |
+| `OTEL_TRACE_WARN_SUPPRESS_LEVEL` | `error` | グループに適用するレベル。`error` = WARN 以下が消えて ERROR は残る。`off` にすると ERROR まで消える |
+| `OTEL_AGENT_LOG_SUPPRESS_EXTRA` | 空 | 既定の 2 件を**残したまま**足す個別指定。`<ロガー名>=<レベル>,...` |
+| `OTEL_AGENT_LOG_SUPPRESS_SPEC` | 上表の 2 件 | 既定の 2 件そのもの。**上書きすると既定が消える**ので、足すだけなら `_EXTRA` を使う |
+| `OTEL_AGENT_LOG_SHADED_ALIAS` | `true` | 再配置後（シェーディング後）のロガー名にも同じレベルを自動で付ける |
 | `OTEL_AGENT_LOG_LEVEL` | 未設定 | エージェントログ全体の下限（最終手段）。設定すると未知の WARN も見えなくなる |
-| `EAP_HTTPS_MODE` (build-arg) | `remove` | `remove`=既定 HTTPS 一式を削除 / `keystore`=8443 を残しビルド時に `application.keystore` を生成 / `keep`=既定のまま（B のフィルタのみ） |
+| `APP_EXTRA_JAVA_OPTS` | 空 | 上記で足りないときの生の JavaOpts。`-Dio.opentelemetry.javaagent.slf4j.simpleLogger.log.<名前>=<レベル>` を直接書ける |
+| `EAP_HTTPS_MODE` | `remove` | `remove`=既定 HTTPS 一式を削除 / `keystore`=8443 を残し起動時に `application.keystore` を生成 / `keep`=既定のまま（B のフィルタのみ）。★CLI が起動時適用になったので build-arg ではなく実行時の環境変数 |
 
 抑制を一時的に外して素の出力を見るには:
 
 ```sh
 docker compose run --rm -e OTEL_AGENT_LOG_SUPPRESS=false front
-docker build -f base/Containerfile --build-arg EAP_HTTPS_MODE=keep -t app-eap-base:1.0 .
+
+# HTTPS の扱いを変える (CLI は起動時適用なのでビルドし直さない)
+EAP_HTTPS_MODE=keep docker compose up -d front
 ```
 
 ---
@@ -421,7 +510,7 @@ docker build -f base/Containerfile --build-arg EAP_HTTPS_MODE=keep -t app-eap-ba
 | プロジェクト | 引き継いでいるもの |
 |---|---|
 | `Container_Compose_JBossEAP_Archive_Exploded_War` | UBI9.8 + OpenJDK21 + EAP8.1、archive 方式の `<fs-archive>` 配備、`readonlyRootFilesystem=true` 対応の `EAP_RUN_DIR` |
-| `Container_ExtraSLB_JVM_https_outbounds` | base/front/back の 3 層構成、CLI のビルド時適用、`standalone_xml_history` 問題の回避。外部 SLB のトラストストアはそちらの成果物を `jvm-env.sh` が拾う |
+| `Container_ExtraSLB_JVM_https_outbounds` | base/front/back の 3 層構成、`embed-server` + `batch` での CLI 適用、`standalone_xml_history` 問題の回避 (本プロジェクトでは適用タイミングを起動時へ移し、履歴を作業領域に作って即消す形にしている)。外部 SLB のトラストストアはそちらの成果物を `jvm-env.sh` が拾う |
 | `Docker_OpenTelemetry` | ADOT Java Agent の投入方法、Compose での Jaeger 併設 |
 | `ADOT_Collector_Sidecar_Generator` | Collector 設定の Secrets Manager 配布、traces のみ有効化する方針 |
 | `Container_Compose_ALB_Lambda` | `intra-api / intra-web / inter-api / sf-api` のサービス構成 |

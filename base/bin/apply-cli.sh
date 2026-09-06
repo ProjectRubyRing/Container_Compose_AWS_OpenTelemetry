@@ -1,13 +1,34 @@
 #!/bin/sh
 # =============================================================================
-#  base/build/apply-cli.sh   (ビルド時のみ実行)
+#  base/bin/apply-cli.sh   (コンテナ起動時に entrypoint.sh から実行される)
 #
 #   embed-server で standalone.xml をオフラインのまま書き換える。
-#   front / back の Containerfile からも同じスクリプトを呼べるよう、
-#   適用対象を --pattern で指定する形にしてある。
+#   適用対象は --pattern で指定する。ロールごとの差 (front=5*.cli /
+#   back=6*.cli) はこの引数だけで吸収し、スクリプト自体は 1 本に保つ。
 #
 #     apply-cli.sh --eap-home /opt/eap --config standalone.xml \
-#                  --cli-dir /opt/app/cli --pattern '0*.cli' --pattern '1*.cli'
+#                  --cli-dir /opt/app/cli --base-dir /run/eap \
+#                  --work-dir /run/eap/tmp \
+#                  --pattern '0*.cli' --pattern '1*.cli'
+#
+#  ---------------------------------------------------------------------------
+#  ★ ビルド時ではなく起動時に走る (--base-dir がその要)
+#  ---------------------------------------------------------------------------
+#   実行時のイメージは readonlyRootFilesystem=true で、$EAP_HOME/standalone は
+#   書き込めない。書き換え先は entrypoint.sh が用意する作業領域
+#   (EAP_RUN_DIR = jboss.server.base.dir) 側の configuration であり、
+#   --base-dir でそこを指す。embed-server は jboss.server.base.dir を見るので、
+#   CLI の JVM にこのシステムプロパティを渡せば standalone.sh の本ブートと
+#   まったく同じ場所を編集できる。
+#
+#   ★ standalone_xml_history の扱い
+#     embed-server は書き換えのたびに configuration/standalone_xml_history を
+#     作る。これを残したまま standalone.sh を起動すると current ディレクトリの
+#     rename が走る。ここでは CLI の直後に履歴ごと消しておくので、本ブートは
+#     「履歴の無い状態からの初回」になり rename 自体が発生しない。
+#     (ビルド時適用のときは overlayfs の下位レイヤに履歴が残ることが
+#      WFLYCTL0414 / WFLYCTL0082 の原因だった。作業領域は通常の書き込み可能な
+#      ファイルシステムなので、消してさえおけば同じ問題は起きない)
 #
 #  ---------------------------------------------------------------------------
 #  ★ 生成されるスクリプトの形 (これが本スクリプトの目的)
@@ -22,7 +43,9 @@
 #     - 全操作が成功したときだけ standalone.xml へ書かれる (原子性)
 #     - 途中で失敗したら全部ロールバックされ、中途半端な設定が残らない
 #     - 書き込みが 1 回にまとまる
-#   という性質になる。ビルドが通った = 設定は全部入った、が保証される。
+#   という性質になる。CLI が通った = 設定は全部入った、が保証される。
+#   途中で落ちれば entrypoint.sh がそこで停止するので、中途半端な設定の
+#   サーバが起動してくることはない。
 #
 #  ---------------------------------------------------------------------------
 #  ★ バッチモードの制約と、その解き方 (ここが本スクリプトの実装の中心)
@@ -40,18 +63,18 @@
 #     パス 1 (probe)  … embed-server を起動し、.cli 中の
 #                       `if (...) of <アドレス>:read-resource` に出てくる
 #                       アドレスの存在有無だけを一括で調べる。設定は変えない。
-#     パス 2 (apply)  … パス 1 の結果で if を「ビルド時に」解決し、
+#     パス 2 (apply)  … パス 1 の結果で if を「CLI へ渡す前に」解決し、
 #                       採用された枝の操作だけを batch ～ run-batch に並べて
 #                       流し込む。echo はバッチに入れられないので、
-#                       ビルドログへの出力に振り替える。
+#                       [apply-cli] のログ行に振り替える。
 #
 #   結果として .cli ファイルは今までどおり if / echo 付きで書けるまま、
 #   実際にサーバへ渡るスクリプトは操作だけのバッチになる。
 #
-#   ※ embed-server の起動はビルド時に 2 回になるが、これはイメージビルドの
-#     中だけの話で、実行時 (standalone.sh) のブート回数は 1 回のまま変わらない。
-#     base/Containerfile が CLI をビルド時に適用している理由
-#     (standalone_xml_history の rename 問題) には一切影響しない。
+#   ※ embed-server の起動は 2 回になる。起動時適用ではこれがそのまま
+#     コンテナの起動時間 (数十秒) に乗る。probe パスは --std-out=discard で
+#     ブートログを捨てているぶん apply パスより速いが、それでもゼロではない。
+#     ガードを一切使わない .cli だけを流す構成なら probe パスは自動で省かれる。
 #
 #  ---------------------------------------------------------------------------
 #  ★ .cli を書くときの制約 (プリプロセッサの仕様)
@@ -64,17 +87,20 @@
 #      「同じ run の中で先行する操作が作成/削除したアドレス」を
 #      ガードの条件に使ってはいけない (評価時点の状態しか見ていないため)。
 #      現状の .cli はすべてこの条件を満たしている。
-#   3. echo はビルドログ行になる。サーバへは渡らない。
+#   3. echo は [apply-cli] のログ行になる。サーバへは渡らない。
 #   4. コメント行と空行はバッチから落とされる (.cli 側が唯一の記述場所)。
 #
 #   --no-batch を付けるとバッチで囲まずに逐次実行する。composite が通らない
-#   操作に当たったときの切り分け専用で、通常のビルドでは使わない。
+#   操作に当たったときの切り分け専用で、通常の起動では使わない。
 # =============================================================================
 set -eu
 
 EAP_HOME="/opt/eap"
 EAP_CONFIG="standalone.xml"
 CLI_DIR="/opt/app/cli"
+BASE_DIR=""                       # jboss.server.base.dir (空 = $EAP_HOME/standalone)
+WORK_ROOT="${TMPDIR:-/tmp}"       # 中間ファイルの置き場 (書き込み可能であること)
+STD_OUT="echo"                    # apply パスの embed-server ブートログ
 PATTERNS=""
 USE_BATCH=1
 
@@ -83,6 +109,9 @@ while [ $# -gt 0 ]; do
         --eap-home) EAP_HOME="$2"; shift 2 ;;
         --config)   EAP_CONFIG="$2"; shift 2 ;;
         --cli-dir)  CLI_DIR="$2"; shift 2 ;;
+        --base-dir) BASE_DIR="$2"; shift 2 ;;
+        --work-dir) WORK_ROOT="$2"; shift 2 ;;
+        --std-out)  STD_OUT="$2"; shift 2 ;;
         --pattern)  PATTERNS="${PATTERNS} $2"; shift 2 ;;
         --no-batch) USE_BATCH=0; shift ;;
         *) echo "[apply-cli] ERROR: 不明な引数: $1" >&2; exit 2 ;;
@@ -93,6 +122,38 @@ die() { echo "[apply-cli] ERROR: $*" >&2; exit 2; }
 
 [ -n "${PATTERNS}" ] || die "--pattern が 1 つも指定されていません"
 [ -x "${EAP_HOME}/bin/jboss-cli.sh" ] || die "${EAP_HOME}/bin/jboss-cli.sh がありません"
+case "${STD_OUT}" in echo|discard) : ;; *) die "--std-out は echo か discard です: ${STD_OUT}" ;; esac
+
+# 書き換え対象の configuration。--base-dir を渡した場合はそちら (実行時)。
+if [ -n "${BASE_DIR}" ]; then
+    CONF_DIR="${BASE_DIR}/configuration"
+else
+    CONF_DIR="${EAP_HOME}/standalone/configuration"
+fi
+[ -f "${CONF_DIR}/${EAP_CONFIG}" ] || die "${CONF_DIR}/${EAP_CONFIG} がありません"
+[ -w "${CONF_DIR}/${EAP_CONFIG}" ] || die "${CONF_DIR}/${EAP_CONFIG} へ uid=$(id -u) で書き込めません"
+
+# -----------------------------------------------------------------------------
+#  jboss-cli.sh の起動 (JAVA_OPTS はここで作り直す)
+#
+#   ★ 実行時に呼ぶうえで外せない処理
+#     jboss-cli.sh は JAVA_OPTS をそのまま CLI の JVM へ渡す。起動時に走る
+#     以上、アプリ用の JAVA_OPTS (JVM_OPTS_MODE=full では -javaagent を含む) が
+#     そのまま効いてしまい、CLI まで計装されて遅くなるうえ無意味なスパンが出る。
+#     JAVA_TOOL_OPTIONS も同じ理由で落とす (README「JBoss EAP 固有の注意点」)。
+#     ここで CLI に必要なぶんだけを組み立て直す。
+#
+#       -Djboss.server.base.dir  embed-server の編集対象を作業領域へ向ける
+#       -Djava.io.tmpdir         readonlyRootFilesystem=true では /tmp が無い
+# -----------------------------------------------------------------------------
+run_cli() {
+    _opts="-Djava.io.tmpdir=${WORK_DIR}"
+    if [ -n "${BASE_DIR}" ]; then
+        _opts="${_opts} -Djboss.server.base.dir=${BASE_DIR}"
+    fi
+    JAVA_OPTS="${_opts}" JAVA_OPTS_APPEND= JAVA_TOOL_OPTIONS= \
+        "${EAP_HOME}/bin/jboss-cli.sh" "$@"
+}
 
 # 適用対象を列挙する。パターン順 = 適用順 (00 -> 10 -> 20 ...)。
 FILES=""
@@ -104,7 +165,9 @@ for p in ${PATTERNS}; do
 done
 [ -n "${FILES}" ] || die "${CLI_DIR} に対象の .cli がありません (${PATTERNS})"
 
-WORK_DIR="$(mktemp -d /tmp/apply-cli.XXXXXX)"
+mkdir -p "${WORK_ROOT}" 2>/dev/null || true
+WORK_DIR="$(mktemp -d "${WORK_ROOT}/apply-cli.XXXXXX")" \
+    || die "作業ディレクトリを ${WORK_ROOT} に作れません (--work-dir で書き込み可能な場所を指定してください)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 PROBE_CLI="${WORK_DIR}/probe.cli"
@@ -224,7 +287,7 @@ if [ -s "${PROBE_ADDRS}" ]; then
         echo "stop-embedded-server"
     } > "${PROBE_CLI}"
 
-    if ! "${EAP_HOME}/bin/jboss-cli.sh" --file="${PROBE_CLI}" > "${PROBE_OUT}" 2>&1; then
+    if ! run_cli --file="${PROBE_CLI}" > "${PROBE_OUT}" 2>&1; then
         echo "[apply-cli] ERROR: probe パスが失敗しました" >&2
         cat "${PROBE_OUT}" >&2
         exit 1
@@ -246,7 +309,7 @@ fi
 #  パス 2: if を解決し、batch ～ run-batch に操作を並べたスクリプトを組み立てる
 # -----------------------------------------------------------------------------
 : > "${RUN_CLI}"
-emit "embed-server --server-config=${EAP_CONFIG} --std-out=echo"
+emit "embed-server --server-config=${EAP_CONFIG} --std-out=${STD_OUT}"
 if [ "${USE_BATCH}" -eq 1 ]; then
     emit "batch"
 fi
@@ -291,7 +354,7 @@ for f in ${FILES}; do
         if [ "${_in_if}" -eq 1 ] && [ "${_taken}" -eq 0 ]; then continue; fi
         if [ "${_in_if}" -eq 2 ] && [ "${_taken}" -eq 1 ]; then continue; fi
 
-        # echo はバッチに積めない。ビルドログへ振り替える。
+        # echo はバッチに積めない。[apply-cli] のログ行へ振り替える。
         case "${_line}" in
             'echo '*|'echo"'*)
                 _msg="${_line#echo}"
@@ -332,11 +395,14 @@ echo "[apply-cli] --- 生成された CLI スクリプト ---"
 sed 's/^/[apply-cli] | /' "${RUN_CLI}"
 echo "[apply-cli] --------------------------------"
 
-"${EAP_HOME}/bin/jboss-cli.sh" --file="${RUN_CLI}"
+run_cli --file="${RUN_CLI}"
 
-# ビルド時に作られた履歴はイメージに残さない。
-# 残すと overlayfs の下位レイヤになり、起動時の rename が原理的に通らなくなる
-# (WFLYCTL0056 / WFLYCTL0414 が毎起動出続ける)。
-rm -rf "${EAP_HOME}/standalone/configuration/standalone_xml_history"
+# embed-server が作った履歴は残さない。
+#   - 起動時適用: 履歴が残っていると続く standalone.sh の本ブートが
+#                 standalone_xml_history/current の rename を試みる。消して
+#                 おけば「履歴の無い状態からの初回ブート」になり発生しない。
+#   - ビルド時に使う場合: 残すと overlayfs の下位レイヤになり、起動時の rename が
+#                 原理的に通らなくなる (WFLYCTL0056 / WFLYCTL0414 が毎起動出続ける)。
+rm -rf "${CONF_DIR}/standalone_xml_history"
 
 echo "[apply-cli] 完了"

@@ -56,6 +56,20 @@ x-app-common: &app-common
     #  イメージは共通。切り替えはこの環境変数だけ。
     JVM_OPTS_MODE: ${JVM_OPTS_MODE:-append}
 
+    # --- JBoss CLI の適用 (コンテナ起動時) -----------------------------------
+    #  .cli はイメージに焼かれておらず、entrypoint.sh が起動のたびに
+    #  作業領域 (/run/eap) の standalone.xml へ適用する。したがって
+    #  構成の変更にイメージの再ビルドは要らない。
+    #
+    #    EAP_HTTPS_MODE   remove (既定) 未使用の既定 HTTPS 一式を削除する
+    #                     keystore      8443 を残し自己署名キーストアを生成する
+    #                     keep          既定のまま (WARN は filter-spec で抑制)
+    #    EAP_CLI_STDOUT   echo (既定) 適用時の embed-server ブートログを出す
+    #                     discard      捨てる (起動ログを静かにしたいとき)
+    #    EAP_CLI_ENABLED  false で CLI 適用そのものを止める (切り分け用)
+    EAP_HTTPS_MODE: ${EAP_HTTPS_MODE:-remove}
+    EAP_CLI_STDOUT: ${EAP_CLI_STDOUT:-echo}
+
     # --- 命名規約の入力 (これだけで service.name が決まる) -------------------
     APP_SERVICE: ${APP_SERVICE:-intra-api}   # intra-api|intra-web|inter-api|sf-api
     APP_ENV: local
@@ -68,6 +82,24 @@ x-app-common: &app-common
     #  を明示するので「有効なのに対象パッケージが空」という起動 WARN は出ない。
     #  使う場合は .env で対象パッケージを指定する (例: com.example.app)。
     APP_SERVICE_EVENT_PACKAGES: ${APP_SERVICE_EVENT_PACKAGES:-}
+
+    # --- トレース関連 WARN の抑制 --------------------------------------------
+    #  エージェントのログは JBoss の logging サブシステムを通らない
+    #  (stderr へ直接書く) ので、抑制は JVM のシステムプロパティで行う。
+    #  otel-env.sh がグループ名からロガー名を引いて -D を組み立てる。
+    #
+    #    resource  EC2/ECS/EKS メタデータが引けない  … 既定 ON
+    #              (Compose には 169.254.170.2 が無いので必ず出る)
+    #    context   Scope.close 忘れ / Context 不整合  … 既定 ON
+    #    export    Collector へ送れない               … 既定 OFF
+    #              ★「X-Ray に出ない」の最初の手掛かりなので既定では消さない
+    #    sampler   X-Ray 集中サンプリング取得失敗     … 既定 OFF
+    #    muzzle    計装の適用失敗                     … 既定 OFF
+    #
+    #  all = 全部 / off = 何もしない。個別のロガー名は
+    #  OTEL_AGENT_LOG_SUPPRESS_EXTRA="<ロガー名>=<レベル>,..." で足す。
+    OTEL_TRACE_WARN_SUPPRESS: ${OTEL_TRACE_WARN_SUPPRESS:-resource,context}
+    OTEL_AGENT_LOG_SUPPRESS_EXTRA: ${OTEL_AGENT_LOG_SUPPRESS_EXTRA:-}
 
     # --- ADOT Collector への送信先 (ECS では http://localhost:4317) ----------
     OTEL_EXPORTER_OTLP_ENDPOINT: http://adot-collector:4317

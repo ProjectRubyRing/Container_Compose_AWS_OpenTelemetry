@@ -10,19 +10,22 @@
 #     2. 書き込み可能な作業領域 (EAP_RUN_DIR = jboss.server.base.dir) を用意
 #     3. configuration をイメージ内シードから複製
 #     4. WAR (archive 方式) の実体を検証
-#     5. 共通シェル (jvm-env*.sh -> otel-env.sh) を source して JVM/OTel 環境を確定
-#        JVM オプションの渡し方は JVM_OPTS_MODE で 2 通りから選ぶ (下の 5. 参照)
-#     6. ADOT サイドカーの待ち合わせ (任意)
-#     7. standalone.sh を exec
+#     5. JBoss CLI を作業領域の standalone.xml へ適用する (apply-cli.sh)
+#     6. 共通シェル (jvm-env*.sh -> otel-env.sh) を source して JVM/OTel 環境を確定
+#        JVM オプションの渡し方は JVM_OPTS_MODE で 2 通りから選ぶ (下の 6. 参照)
+#     7. ADOT サイドカーの待ち合わせ (任意)
+#     8. standalone.sh を exec
 #
 #   環境変数は Containerfile の ENV に既定値を焼き込んである。
 # =============================================================================
 set -eu
 
 : "${JBOSS_HOME:=/opt/eap}"
+: "${APP_DIR:=/opt/app}"
 : "${APP_BIN_DIR:=/opt/app/bin}"
 : "${EAP_RUN_DIR:=/run/eap}"
 : "${EAP_SEED_DIR:=/opt/eap-seed}"
+: "${EAP_TMP_DIR:=${EAP_RUN_DIR}/tmp}"
 : "${EAP_CONFIG:=standalone.xml}"
 : "${EAP_CONFIG_SEED:=always}"
 : "${APP_NAME:=app.war}"
@@ -33,6 +36,12 @@ set -eu
 : "${EAP_BIND_MANAGEMENT:=127.0.0.1}"
 : "${EAP_DROP_PRIVILEGES:=auto}"
 : "${JVM_OPTS_MODE:=append}"
+: "${EAP_CLI_ENABLED:=true}"
+: "${EAP_CLI_DIR:=${APP_DIR}/cli}"
+: "${EAP_CLI_PATTERNS:=}"
+: "${EAP_CLI_ROLE_PATTERNS:=}"
+: "${EAP_CLI_STDOUT:=echo}"
+: "${EAP_HTTPS_MODE:=remove}"
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
@@ -82,8 +91,11 @@ export HOME
 
 # =============================================================================
 # 3. configuration のシード
-#    standalone.xml には WAR の unmanaged deployment とデータソースが
-#    ビルド時に焼き込まれている。read-only なイメージ側ではなく作業領域で使う。
+#    イメージが持っているのは素の standalone.xml (シード) だけ。WAR の
+#    unmanaged deployment もデータソースも、この後の 5. で CLI が入れる。
+#    read-only なイメージ側では書き換えられないので、まず作業領域へ複製する。
+#    EAP_CONFIG_SEED=always (既定) なら毎起動シードからやり直すため、
+#    「前回の起動が残した設定」に引きずられない。
 # =============================================================================
 CONF_DST="${EAP_RUN_DIR}/configuration"
 [ -d "${EAP_SEED_DIR}/configuration" ] || die "シード元がありません: ${EAP_SEED_DIR}/configuration (イメージのビルドに失敗しています)" 22
@@ -99,9 +111,9 @@ fi
 
 # =============================================================================
 # 4. WAR (archive 方式) の検証
-#    standalone.xml には <fs-archive path="..."/> が焼き込まれている。
+#    この後の CLI が <fs-archive path="..."/> としてこのパスを登録する。
 #    実体がディレクトリだったり無かったりすると EAP のエラーからは原因が
-#    分かりにくいので、起動前に落とす。
+#    分かりにくいので、CLI を流す前に落とす。
 # =============================================================================
 [ -e "${APP_DEPLOY_PATH}" ] || die "デプロイ資材がありません: ${APP_DEPLOY_PATH}" 10
 [ -f "${APP_DEPLOY_PATH}" ] || die "${APP_DEPLOY_PATH} が通常ファイルではありません。archive 方式は単一の WAR ファイルを前提にしています。" 10
@@ -109,7 +121,116 @@ fi
 log "payload ok: ${APP_DEPLOY_PATH} ($(wc -c < "${APP_DEPLOY_PATH}") bytes, archive)"
 
 # =============================================================================
-# 5. 共通シェルで JVM / OpenTelemetry の環境を確定する
+# 5. JBoss CLI を作業領域の standalone.xml へ適用する
+#
+#    ★ ここで適用する (ビルド時ではない)
+#      イメージに焼くのはシードの standalone.xml (素の状態) だけにして、
+#      設定は毎起動 embed-server で組み立て直す。
+#        - 同じイメージのまま、起動時の環境変数で構成を変えられる
+#          (EAP_HTTPS_MODE / EAP_CLI_PATTERNS / .cli の追加投入)
+#        - front / back のイメージビルドが「WAR を置くだけ」になり、
+#          ビルドが速くなる & ベースの設定と食い違わない
+#
+#    ★ 代償: コンテナの起動が embed-server 2 回ぶん (数十秒) 遅くなる。
+#      compose / ECS のヘルスチェックには start_period / startPeriod で
+#      余裕を取ってある (120s / 180s)。
+#
+#    ★ standalone_xml_history について
+#      起動時に embed-server を回すと configuration/standalone_xml_history が
+#      でき、続く standalone.sh の本ブートが current の rename を試みる。
+#      これがビルド時適用を選んでいた理由 (Compose では WFLYCTL0414 の警告、
+#      ECS では WFLYCTL0082 でブート失敗、という環境差) だが、
+#        - 書き換え先が overlayfs の下位レイヤではなく、この作業領域
+#          (compose=tmpfs / ECS=volume) であること
+#        - apply-cli.sh が適用直後に履歴ごと削除すること
+#      の 2 点で、本ブートは「履歴の無い状態からの初回」になり rename 自体が
+#      発生しない。
+#
+#    適用順は --pattern の並び順。00 -> 10 -> 20 -> (30) -> 31 -> ロール固有。
+#      EAP_CLI_PATTERNS       指定するとこの導出を丸ごと置き換える (空白区切り)
+#      EAP_CLI_ROLE_PATTERNS  ロール固有ぶん (front=5*.cli / back=6*.cli)
+#      EAP_CLI_ENABLED=false  CLI 適用そのものを止める (シードのまま起動する)
+# =============================================================================
+if [ "${EAP_CLI_ENABLED}" = "true" ]; then
+    [ -x "${APP_BIN_DIR}/apply-cli.sh" ] || die "${APP_BIN_DIR}/apply-cli.sh がありません" 24
+    [ -d "${EAP_CLI_DIR}" ] || die "CLI ディレクトリがありません: ${EAP_CLI_DIR}" 24
+
+    # --- 既定 HTTPS (8443) / application.keystore の扱い ---------------------
+    #   remove   (既定) 30*.cli を適用して未使用の HTTPS 一式を削除する。
+    #                   WFLYELY00023 / WFLYELY01084 は原理的に発生しない。
+    #   keystore        HTTPS を残し、キーストアを作業領域に生成する。
+    #                   ファイルが在るので WARN は出ない (自己署名)。
+    #   keep            既定のまま。WARN は 31*.cli の filter-spec で抑制する。
+    HTTPS_PATTERN=""
+    case "${EAP_HTTPS_MODE}" in
+        remove)
+            HTTPS_PATTERN='30*.cli' ;;
+        keep)
+            log "EAP_HTTPS_MODE=keep: 既定 HTTPS を残します (WARN は filter-spec で抑制)" ;;
+        keystore)
+            KS_PATH="${CONF_DST}/application.keystore"
+            if [ -f "${KS_PATH}" ]; then
+                log "EAP_HTTPS_MODE=keystore: ${KS_PATH} は既にあります"
+            else
+                #  ★ "password" は standalone.xml の applicationKS の
+                #    credential-reference と一致させるための EAP 既定値。
+                #    変更する場合は elytron 側も併せて書き換えること。
+                : "${EAP_KEYSTORE_PASSWORD:=password}"
+                KEYTOOL="$(command -v keytool 2>/dev/null || true)"
+                [ -n "${KEYTOOL}" ] || KEYTOOL="${JAVA_HOME:-/usr/lib/jvm/jre-21}/bin/keytool"
+                [ -x "${KEYTOOL}" ] || die "keytool が見つかりません (${KEYTOOL})" 24
+                log "EAP_HTTPS_MODE=keystore: ${KS_PATH} を生成します (自己署名)"
+                "${KEYTOOL}" -genkeypair -noprompt \
+                    -keystore "${KS_PATH}" \
+                    -storetype JKS \
+                    -storepass "${EAP_KEYSTORE_PASSWORD}" -keypass "${EAP_KEYSTORE_PASSWORD}" \
+                    -alias server -keyalg RSA -keysize 2048 -validity 3650 \
+                    -dname "CN=localhost, OU=container, O=local, L=local, ST=local, C=JP" \
+                    -ext "SAN=dns:localhost,ip:127.0.0.1"
+            fi ;;
+        *)
+            die "EAP_HTTPS_MODE は remove | keystore | keep のいずれかです: [${EAP_HTTPS_MODE}]" 24 ;;
+    esac
+
+    #  サブシェルで組み立てる。$@ にはコンテナのコマンド (run-server) が
+    #  入っているので、ここで set -- を使っても親には影響させない。
+    #  set -f はパターン (5*.cli) を作業領域のファイル名に展開させないため。
+    (
+        set -f
+        set -- --eap-home "${JBOSS_HOME}" \
+               --config   "${EAP_CONFIG}" \
+               --cli-dir  "${EAP_CLI_DIR}" \
+               --base-dir "${EAP_RUN_DIR}" \
+               --work-dir "${EAP_TMP_DIR}" \
+               --std-out  "${EAP_CLI_STDOUT}"
+        if [ -n "${EAP_CLI_PATTERNS}" ]; then
+            for p in ${EAP_CLI_PATTERNS}; do set -- "$@" --pattern "${p}"; done
+        else
+            set -- "$@" --pattern '0*.cli' --pattern '1*.cli' --pattern '2*.cli'
+            [ -z "${HTTPS_PATTERN}" ] || set -- "$@" --pattern "${HTTPS_PATTERN}"
+            set -- "$@" --pattern '31*.cli'
+            for p in ${EAP_CLI_ROLE_PATTERNS}; do set -- "$@" --pattern "${p}"; done
+        fi
+        exec "${APP_BIN_DIR}/apply-cli.sh" "$@"
+    ) || die "CLI の適用に失敗しました。上の [apply-cli] の出力を確認してください。" 25
+
+    # --- 配備が焼き込まれたことの確認 ----------------------------------------
+    #     ロール固有 CLI (5*/6*.cli) が WAR を <fs-archive> として登録する。
+    #     ここが空のまま起動すると「200 が返らないだけ」の分かりにくい形で
+    #     失敗するので、起動前に落とす。
+    if [ -n "${EAP_CLI_ROLE_PATTERNS}" ] && [ -z "${EAP_CLI_PATTERNS}" ]; then
+        grep -q 'fs-archive' "${CONF_DST}/${EAP_CONFIG}" \
+            || die "${EAP_CONFIG} に <fs-archive> が焼き込まれていません (ロール固有 CLI: ${EAP_CLI_ROLE_PATTERNS})" 26
+        log "焼き込まれた <deployments>:"
+        sed -n '/<deployments>/,/<\/deployments>/p' "${CONF_DST}/${EAP_CONFIG}" \
+            | sed 's/^/[entrypoint] | /'
+    fi
+else
+    log "EAP_CLI_ENABLED=false: CLI を適用せずシードの ${EAP_CONFIG} のまま起動します"
+fi
+
+# =============================================================================
+# 6. 共通シェルで JVM / OpenTelemetry の環境を確定する
 #    ここで APP_SERVICE / APP_ROLE の規約違反があれば otel-env.sh が停止する。
 #
 #    JVM オプションの渡し方は 2 通り用意してあり、JVM_OPTS_MODE で選ぶ。
@@ -144,7 +265,7 @@ if command -v jvm_print_summary >/dev/null 2>&1; then
 fi
 
 # =============================================================================
-# 6. ADOT サイドカーの待ち合わせ (任意)
+# 7. ADOT サイドカーの待ち合わせ (任意)
 #
 #    ECS はタスク内コンテナの起動順を dependsOn で制御できるが、
 #    「プロセスが listen 済み」までは保証しない。EAP の起動は数十秒かかるので
@@ -179,7 +300,7 @@ if [ "${OTEL_WAIT_FOR_COLLECTOR}" = "true" ]; then
 fi
 
 # =============================================================================
-# 7. 起動
+# 8. 起動
 # =============================================================================
 if [ $# -gt 0 ] && [ "$1" != "run-server" ]; then
     # デバッグ用の脱出口 (docker run <image> sh など)

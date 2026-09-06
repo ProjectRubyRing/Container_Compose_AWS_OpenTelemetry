@@ -87,6 +87,8 @@
         { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://localhost:4317" },
         { "name": "OTEL_EXPORTER_OTLP_PROTOCOL", "value": "grpc" },
         { "name": "OTEL_WAIT_FOR_COLLECTOR",     "value": "true" },
+        { "_comment": "--- トレース関連 WARN の抑制: resource|context|export|sampler|muzzle / all / off (export と sampler は既定で消さない) ---" },
+        { "name": "OTEL_TRACE_WARN_SUPPRESS",   "value": "resource,context" },
 
         { "_comment": "--- back も同一タスク内 = localhost ---" },
         { "name": "BACKEND_HOST", "value": "localhost" },
@@ -169,6 +171,8 @@
         { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://localhost:4317" },
         { "name": "OTEL_EXPORTER_OTLP_PROTOCOL", "value": "grpc" },
         { "name": "OTEL_WAIT_FOR_COLLECTOR",     "value": "true" },
+        { "_comment": "--- トレース関連 WARN の抑制: resource|context|export|sampler|muzzle / all / off (export と sampler は既定で消さない) ---" },
+        { "name": "OTEL_TRACE_WARN_SUPPRESS",   "value": "resource,context" },
 
         { "name": "DB_HOST", "value": "<aurora-cluster>.cluster-<id>.<region>.rds.amazonaws.com" },
         { "name": "DB_PORT", "value": "3306" },

@@ -34,15 +34,16 @@
 #    となり、副作用は「コンテナに直接 HTTPS で繋げなくなる」ことだけ。
 #
 #  【HTTPS を残したい場合】
-#    このファイルを適用しないこと。base/Containerfile のビルド引数
-#      --build-arg EAP_HTTPS_MODE=keystore   … 8443 を残し、ビルド時に
-#                                              application.keystore を生成する
-#                                              (ファイルが在れば WARN は出ない)
-#      --build-arg EAP_HTTPS_MODE=keep       … 既定のまま (WARN は 31-*.cli で抑制)
-#    を使う。既定は EAP_HTTPS_MODE=remove (= このファイルを適用)。
+#    このファイルを適用しないこと。CLI は entrypoint.sh がコンテナ起動時に
+#    適用するので、切り替えは実行時の環境変数だけで済む (再ビルドは不要)。
+#      EAP_HTTPS_MODE=keystore   … 8443 を残し、起動時に作業領域へ
+#                                  application.keystore を生成する
+#                                  (ファイルが在れば WARN は出ない)
+#      EAP_HTTPS_MODE=keep       … 既定のまま (WARN は 31-*.cli で抑制)
+#    既定は EAP_HTTPS_MODE=remove (= このファイルを適用)。
 #
 #  すべて if で存在チェックしているため、既に外れている構成へ再適用しても
-#  失敗しない (front/back の再ビルドで何度でも通る)。
+#  失敗しない (毎起動この CLI が流れるため、冪等であることが前提)。
 #
 #  ★ 依存の向きがあるので削除順を変えないこと
 #    https-listener -> server-ssl-context -> key-manager -> key-store
