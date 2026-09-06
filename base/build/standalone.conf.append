@@ -8,6 +8,11 @@
 #   Java 17+ 用の --add-opens 群など) がまるごと消える。
 #  事故を避けるため、追記はここで行い、運用と共通シェルからは
 #  JAVA_OPTS_APPEND だけを使う。
+#
+#  ※ これは JVM_OPTS_MODE=append (既定 / base/bin/jvm-env.sh) 用のフック。
+#    JVM_OPTS_MODE=full (base/bin/jvm-env-javaopts.sh) では JAVA_OPTS を
+#    共通シェルが直接組み立て、消える既定値もそちらが全部持つ。その際
+#    JAVA_OPTS_APPEND は空にして渡ってくるので、下の if は no-op になる。
 # =============================================================================
 
 if [ "x${PRESERVE_JAVA_OPTS:-}" != "xtrue" ]; then

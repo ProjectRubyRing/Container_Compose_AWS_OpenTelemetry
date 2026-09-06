@@ -10,7 +10,8 @@
 #     2. 書き込み可能な作業領域 (EAP_RUN_DIR = jboss.server.base.dir) を用意
 #     3. configuration をイメージ内シードから複製
 #     4. WAR (archive 方式) の実体を検証
-#     5. 共通シェル (jvm-env.sh -> otel-env.sh) を source して JVM/OTel 環境を確定
+#     5. 共通シェル (jvm-env*.sh -> otel-env.sh) を source して JVM/OTel 環境を確定
+#        JVM オプションの渡し方は JVM_OPTS_MODE で 2 通りから選ぶ (下の 5. 参照)
 #     6. ADOT サイドカーの待ち合わせ (任意)
 #     7. standalone.sh を exec
 #
@@ -31,6 +32,7 @@ set -eu
 : "${EAP_BIND:=0.0.0.0}"
 : "${EAP_BIND_MANAGEMENT:=127.0.0.1}"
 : "${EAP_DROP_PRIVILEGES:=auto}"
+: "${JVM_OPTS_MODE:=append}"
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
@@ -109,11 +111,37 @@ log "payload ok: ${APP_DEPLOY_PATH} ($(wc -c < "${APP_DEPLOY_PATH}") bytes, arch
 # =============================================================================
 # 5. 共通シェルで JVM / OpenTelemetry の環境を確定する
 #    ここで APP_SERVICE / APP_ROLE の規約違反があれば otel-env.sh が停止する。
+#
+#    JVM オプションの渡し方は 2 通り用意してあり、JVM_OPTS_MODE で選ぶ。
+#    どちらのモードでも otel-env.sh は共通で、OTEL_* の導出は変わらない。
+#
+#      append (既定)  jvm-env.sh
+#                     JAVA_OPTS_APPEND だけを組み立て、standalone.conf に
+#                     連結させる。standalone.conf が持つ EAP の既定値
+#                     (-Djboss.modules.system.pkgs / -Djava.awt.headless など) は
+#                     そのまま残る。EAP の推奨に沿った安全側。
+#
+#      full           jvm-env-javaopts.sh
+#                     JAVA_OPTS を直接組み立てる。JAVA_OPTS を渡すと
+#                     standalone.conf は既定値を一切組み立てなくなるので、
+#                     消えるぶんはすべて jvm-env-javaopts.sh が明示的に持つ。
+#                     standalone.conf 経由の設定を使わない構成向け。
 # =============================================================================
-[ -r "${APP_BIN_DIR}/jvm-env.sh" ] || die "共通シェルがありません: ${APP_BIN_DIR}/jvm-env.sh" 30
+case "${JVM_OPTS_MODE}" in
+    append) JVM_ENV_SCRIPT="jvm-env.sh" ;;
+    full)   JVM_ENV_SCRIPT="jvm-env-javaopts.sh" ;;
+    *)      die "JVM_OPTS_MODE は append か full です: ${JVM_OPTS_MODE}" 31 ;;
+esac
+log "JVM_OPTS_MODE=${JVM_OPTS_MODE} -> ${JVM_ENV_SCRIPT}"
+
+[ -r "${APP_BIN_DIR}/${JVM_ENV_SCRIPT}" ] || die "共通シェルがありません: ${APP_BIN_DIR}/${JVM_ENV_SCRIPT}" 30
 # shellcheck source=/dev/null
-. "${APP_BIN_DIR}/jvm-env.sh"
+. "${APP_BIN_DIR}/${JVM_ENV_SCRIPT}"
 otel_print_summary
+# JAVA_OPTS 版だけが持つ要約 (組み立て後の JAVA_OPTS 全文)
+if command -v jvm_print_summary >/dev/null 2>&1; then
+    jvm_print_summary
+fi
 
 # =============================================================================
 # 6. ADOT サイドカーの待ち合わせ (任意)

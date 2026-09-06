@@ -15,7 +15,7 @@ AWS X-Ray に分かりやすく可視化する**ための実装一式。
 |---|---|
 | ベースコンテナ | UBI 9.8 + Red Hat build of OpenJDK 21 + JBoss EAP 8.1 (jboss-cli.sh 構成) + ADOT Java Agent |
 | front / back | ベースを継承し、WAR (archive 方式) と固有 CLI だけを足す |
-| 共通シェル | `jvm-env.sh` → `otel-env.sh`。JVM と OpenTelemetry の環境変数を 1 か所で組み立てる |
+| 共通シェル | `jvm-env.sh` → `otel-env.sh`。JVM と OpenTelemetry の環境変数を 1 か所で組み立てる (JVM オプションの渡し方は 2 通り) |
 | ADOT サイドカー | Collector 設定 2 本 (X-Ray 用 / Jaeger 用)。差分は `★XRAY-DIFF` コメントのみ |
 | ローカル環境 | Compose 一式。ALB / 帳票 EC2 / EC2 バッチ / Lambda / SQS のスタブ込み |
 | ECS | タスク定義テンプレートと 4 サービスぶんの生成スクリプト |
@@ -29,7 +29,8 @@ base/                     ★ front/back 共通のベースコンテナ
   Containerfile             UBI9.8 + OpenJDK21 + EAP8.1 + ADOT Agent
   bin/
     entrypoint.sh           起動処理 (共通)
-    jvm-env.sh              ★ JVM 環境変数の共通シェル
+    jvm-env.sh              ★ JVM 環境変数の共通シェル (JAVA_OPTS_APPEND 版 / 既定)
+    jvm-env-javaopts.sh     ★ 同上 (JAVA_OPTS 版。既定値を全部自前で持つ)
     otel-env.sh             ★ OpenTelemetry 環境変数の共通シェル (命名規約の実体)
     healthcheck.sh
   cli/
@@ -220,14 +221,91 @@ aws ecs register-task-definition --cli-input-json file://ecs/generated/intra-api
 
 | 項目 | 内容 |
 |---|---|
-| `JAVA_OPTS` を直接渡さない | standalone.conf が既定値を組み立てなくなり `--add-opens` 等が消える。`JAVA_OPTS_APPEND` を使う |
-| `JAVA_TOOL_OPTIONS` を使わない | `jboss-cli.sh` まで計装され、CLI が遅くなり無意味なスパンが出る。`-javaagent` は `JAVA_OPTS_APPEND` へ |
+| `JAVA_OPTS` を直接渡すなら既定値を全部自前で持つ | standalone.conf は `JAVA_OPTS` が未設定のときしか既定値を組み立てない。既定 (`JVM_OPTS_MODE=append`) は `JAVA_OPTS_APPEND` を使い、直接渡す場合は `JVM_OPTS_MODE=full` (`jvm-env-javaopts.sh`) で消える既定値を明示する |
+| `JAVA_TOOL_OPTIONS` を使わない | `jboss-cli.sh` まで計装され、CLI が遅くなり無意味なスパンが出る。`-javaagent` は `JAVA_OPTS_APPEND` / `JAVA_OPTS` へ |
 | `JBOSS_MODULES_SYSTEM_PKGS` | `io.opentelemetry.javaagent` を追加必須。無いとクラスローダ隔離で `NoClassDefFoundError` |
 | EAP 内蔵 opentelemetry サブシステム | Java Agent と二重計装になりスパンが 2 本出る。`10-remove-mp-opentelemetry.cli` で外す |
 | `OTEL_SERVICE_NAME` を必ず明示 | エージェントはデプロイ名から service.name を推測する。明示しないと 4 サービスぶんの front が全部 `front` という 1 ノードに潰れる |
 | CLI はビルド時に適用 | 起動時 `embed-server` は設定ブートストラップを 2 回にし、`standalone_xml_history` の rename が Compose では警告・ECS では起動失敗という環境差を生む |
 | Valkey は Jedis / Lettuce で | `valkey-java` はエージェントの計装対象外。使うとキャッシュアクセスのスパンが一切出ない |
 | コンテキストルートを分ける | front=`/front` / back=`/back`。実 ALB はパスを書き換えず転送するため、両方 `/app` だとパスベースのルールで振り分けられない |
+
+---
+
+## JVM オプションの渡し方 (2 パターン)
+
+JVM オプションの渡し方は 2 通り実装してあり、**起動時の環境変数
+`JVM_OPTS_MODE` だけで切り替わる**。イメージは 1 つのまま、どちらでも動く。
+どちらのモードでも `otel-env.sh` は共通なので、`OTEL_*` の導出と命名規約は変わらない。
+
+| | `JVM_OPTS_MODE=append` (既定) | `JVM_OPTS_MODE=full` |
+|---|---|---|
+| 実体 | `base/bin/jvm-env.sh` | `base/bin/jvm-env-javaopts.sh` |
+| 組み立てる変数 | `JAVA_OPTS_APPEND` | `JAVA_OPTS` |
+| EAP の既定値 | standalone.conf がそのまま組み立てる | **消えるので全部自前で持つ** |
+| standalone.conf | `standalone.conf.append` が `JAVA_OPTS_APPEND` を連結する | 経由しない (`JAVA_OPTS_APPEND` を空にするのでフックは no-op) |
+| 向き | EAP の推奨に沿った安全側 | standalone.conf に依存したくない構成 |
+
+### なぜ `full` では「全部自前」になるのか
+
+standalone.conf は `JAVA_OPTS` をこうとしか組み立てない。
+
+```sh
+if [ "x$JAVA_OPTS" = "x" ]; then
+    JAVA_OPTS="$JBOSS_JAVA_SIZING -Djava.net.preferIPv4Stack=true"
+    JAVA_OPTS="$JAVA_OPTS -Djboss.modules.system.pkgs=$JBOSS_MODULES_SYSTEM_PKGS -Djava.awt.headless=true"
+else
+    echo "JAVA_OPTS already set in environment; overriding default settings with values: $JAVA_OPTS"
+fi
+```
+
+外から `JAVA_OPTS` を渡した瞬間に `else` 側へ落ち、**この 4 つが 1 つも付かない**。
+`jvm-env-javaopts.sh` はこれを同じ順序で再現したうえで、本構成ぶん
+(`java.io.tmpdir` / DNS TTL / トラストストア) と `otel-env.sh` が積んだ
+`-javaagent` を連結する。
+
+★ 一番危険なのは **`-Djboss.modules.system.pkgs` が落ちること**。
+`JBOSS_MODULES_SYSTEM_PKGS` 環境変数そのものは guard の外で既定値が入るので
+「変数はある」が、`-D` へ変換しているのは guard の中だけ。ここが落ちると
+JBoss Modules のクラスローダ隔離から `io.opentelemetry.javaagent` が外れ、
+**起動はするのに X-Ray に何も出ない**という一番気づきにくい壊れ方をする。
+
+### `full` で追加される環境変数
+
+| 変数 | 既定 | 用途 |
+|---|---|---|
+| `JVM_OPTS_MODE` | `append` | `full` でこのモードに入る |
+| `JVM_METASPACE_SIZE` / `JVM_MAX_METASPACE_SIZE` | `96M` / `256M` | EAP 既定の Metaspace 指定を踏襲する (ヒープは既存どおり割合指定) |
+| `JVM_MODULAR_OPTS_MODE` | `explicit` | `--add-opens` 一式を自分で書くか (`explicit`)、`standalone.sh` に任せるか (`delegate`) |
+| `JVM_MODULAR_OPTS` | 一覧を内蔵 | `--add-opens` 一式を丸ごと差し替えたい場合 |
+| `JVM_PRESERVE_JAVA_OPTS` | `false` | `true` で `PRESERVE_JAVA_OPTS=true` を立て、`standalone.sh` にも `JAVA_OPTS` を触らせない |
+
+`--add-opens` 一式だけは standalone.conf ではなく `standalone.sh`
+(`bin/common.sh` の `setDefaultModularJvmOptions`) が付けているため、
+`JAVA_OPTS` を渡しても実は消えない。それでも `explicit` を既定にしているのは
+「JVM に渡る値はこのファイルを読めば全部わかる」を優先しているため。
+一覧の最後に `--add-modules=java.se` が入るので `standalone.sh` 側は何も足さず、
+二重に付くこともない。**起動直後に `IllegalAccessError` /
+`InaccessibleObjectException` が出たら、まず `JVM_MODULAR_OPTS_MODE=delegate`
+を試す**こと (EAP の版が一覧にない `--add-opens` を要求している可能性)。
+
+### 確認
+
+```bash
+# 組み立て結果だけを見る (コンテナ外でも動く)
+sh base/bin/jvm-env-javaopts.sh --print
+
+# 起動ログでの確認。full のときだけ JAVA_OPTS の全文が出る
+docker compose up -d
+docker compose logs back | grep -E 'jvm-env|JAVA_OPTS'
+```
+
+Compose で切り替える場合:
+
+```yaml
+    environment:
+      JVM_OPTS_MODE: full
+```
 
 ---
 

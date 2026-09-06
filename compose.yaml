@@ -48,6 +48,14 @@ x-app-common: &app-common
   environment: &app-env
     TZ: Asia/Tokyo
 
+    # --- JVM オプションの渡し方 (2 パターン) ----------------------------------
+    #  append (既定) … jvm-env.sh が JAVA_OPTS_APPEND を組み立て、
+    #                  standalone.conf が EAP の既定値と連結する
+    #  full          … jvm-env-javaopts.sh が JAVA_OPTS を直接組み立てる。
+    #                  standalone.conf の既定値は付かなくなるので全部自前で持つ
+    #  イメージは共通。切り替えはこの環境変数だけ。
+    JVM_OPTS_MODE: ${JVM_OPTS_MODE:-append}
+
     # --- 命名規約の入力 (これだけで service.name が決まる) -------------------
     APP_SERVICE: ${APP_SERVICE:-intra-api}   # intra-api|intra-web|inter-api|sf-api
     APP_ENV: local

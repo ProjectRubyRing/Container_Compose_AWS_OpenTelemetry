@@ -11,13 +11,27 @@
 #              └─ source otel-env.sh    … OTEL_* と -javaagent
 #
 #   ---------------------------------------------------------------------------
-#   JAVA_OPTS を直接設定してはいけない理由
+#   このファイル (append 版) が JAVA_OPTS を直接設定しない理由
 #   ---------------------------------------------------------------------------
 #   JBoss EAP の standalone.conf は「JAVA_OPTS が未設定のときだけ既定値を
 #   組み立てる」作りになっている。外から JAVA_OPTS を渡すと
-#     -Djava.awt.headless / -Djboss.modules.system.pkgs / ヒープ指定 / --add-opens
+#     -Djava.awt.headless / -Djboss.modules.system.pkgs / ヒープ指定
 #   といった EAP 動作に必要な既定値がまるごと消える。
-#   追記は必ず JAVA_OPTS_APPEND を使う (standalone.conf.append が連結する)。
+#   このファイルでは追記に必ず JAVA_OPTS_APPEND を使う
+#   (standalone.conf.append が連結する)。
+#
+#   ---------------------------------------------------------------------------
+#   JAVA_OPTS を直接組み立てる版もある
+#   ---------------------------------------------------------------------------
+#   standalone.conf 経由の設定を使いたくない場合のために、消える既定値を
+#   すべて自前で持つ jvm-env-javaopts.sh を用意してある。
+#   entrypoint.sh が JVM_OPTS_MODE でどちらを source するか決める。
+#
+#       JVM_OPTS_MODE=append (既定) … このファイル
+#       JVM_OPTS_MODE=full          … jvm-env-javaopts.sh
+#
+#   ★ 3. の共通 JVM オプション (tmpdir / DNS TTL / トラストストア) は
+#     両方のファイルが同じ内容を持っている。片方だけ直さないこと。
 # =============================================================================
 
 jvm_log() { echo "[jvm-env] $*"; }

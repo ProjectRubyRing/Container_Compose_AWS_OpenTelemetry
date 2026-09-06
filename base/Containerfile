@@ -246,6 +246,11 @@ RUN set -eu; \
 #     ★ standalone.conf は「JAVA_OPTS が未設定のときだけ既定値を組み立てる」
 #       作りなので、外から JAVA_OPTS を渡すと EAP 必須の既定値が全部消える。
 #       共通シェルは JAVA_OPTS_APPEND だけを組み立て、ここで連結する。
+#
+#     ※ これは JVM_OPTS_MODE=append (既定) 用のフック。
+#       JVM_OPTS_MODE=full (jvm-env-javaopts.sh) では JAVA_OPTS_APPEND を
+#       空にして通るため、このフックは no-op になる。イメージは 1 つのまま
+#       起動時の環境変数だけで両モードを切り替えられる。
 # -----------------------------------------------------------------------------
 COPY base/build/standalone.conf.append /tmp/standalone.conf.append
 RUN set -eu; \
@@ -371,6 +376,7 @@ ENV JBOSS_HOME=${EAP_HOME} \
     EAP_BIND=0.0.0.0 \
     EAP_BIND_MANAGEMENT=127.0.0.1 \
     EAP_DROP_PRIVILEGES=auto \
+    JVM_OPTS_MODE=append \
     ADOT_AGENT_PATH=${ADOT_AGENT_PATH} \
     OTEL_AGENT_ENABLED=true \
     HEALTHCHECK_CONTEXT=/app \
