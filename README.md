@@ -114,6 +114,14 @@ annotation.app_peer    = "aurora-mysql"   # Aurora を呼んでいるスパン�
 同じ transform をローカルの Collector でも通しているので、
 Jaeger の Tags 欄でも `app_caller=batch-ec2` で同じ結果が得られる。
 
+`indexed_attributes` に並べるのは **transform 後のフラットなスパン属性名**
+(`app_ns` / `app_env` / `app_role` / `ecs_cluster` / `ecs_service` /
+`ecs_task_family`) であって、`service.namespace` や `aws.ecs.task.family` の
+ようなリソース属性名ではない。書き間違えてもエラーにならず
+「annotation が付かないだけ」なので、`./scripts/smoke-trace.sh` の後に
+Jaeger の Tags で 1 つずつ引けることを確認する。
+→ 対応表と確認手順: [`docs/xray-vs-jaeger.md`](docs/xray-vs-jaeger.md#3-リソース属性は-x-ray-では検索できない)
+
 ### 4. ADOT 版エージェントを使う (標準エージェントでは動かない)
 
 X-Ray はトレース ID の先頭 4 バイトを epoch 秒として解釈し、

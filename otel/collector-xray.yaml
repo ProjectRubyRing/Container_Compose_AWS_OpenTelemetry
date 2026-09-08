@@ -150,6 +150,16 @@ processors:
           - set(attributes["app_role"],    resource.attributes["app.role"])    where resource.attributes["app.role"] != nil
           - set(attributes["app_env"],     resource.attributes["deployment.environment.name"]) where resource.attributes["deployment.environment.name"] != nil
           - set(attributes["app_ns"],      resource.attributes["service.namespace"]) where resource.attributes["service.namespace"] != nil
+          # --- ECS クラスタ名 ---
+          #     ecs ディテクタが付けるのは aws.ecs.cluster.arn であり
+          #     aws.ecs.cluster.name ではない。indexed_attributes に
+          #     クラスタ名を並べても値が入らない事故を防ぐため、
+          #     name があればそれを、無ければ ARN の末尾を切り出して使う。
+          #       arn:aws:ecs:<region>:<acct>:cluster/<name> -> <name>
+          - set(attributes["ecs_cluster"], resource.attributes["aws.ecs.cluster.name"]) where resource.attributes["aws.ecs.cluster.name"] != nil
+          - set(attributes["ecs_cluster"], resource.attributes["aws.ecs.cluster.arn"]) where attributes["ecs_cluster"] == nil and resource.attributes["aws.ecs.cluster.arn"] != nil
+          - replace_pattern(attributes["ecs_cluster"], "^arn:.*:cluster/", "") where attributes["ecs_cluster"] != nil
+
           - set(attributes["ecs_service"], resource.attributes["aws.ecs.service.name"]) where resource.attributes["aws.ecs.service.name"] != nil
           - set(attributes["ecs_task_family"], resource.attributes["aws.ecs.task.family"]) where resource.attributes["aws.ecs.task.family"] != nil
 
@@ -199,6 +209,7 @@ exporters:
       - app_ns
       - app_peer
       - app_caller
+      - ecs_cluster
       - ecs_service
       - ecs_task_family
     index_all_attributes: false

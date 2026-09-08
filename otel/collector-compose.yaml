@@ -81,6 +81,9 @@ processors:
           - set(attributes["app_role"],    resource.attributes["app.role"])    where resource.attributes["app.role"] != nil
           - set(attributes["app_env"],     resource.attributes["deployment.environment.name"]) where resource.attributes["deployment.environment.name"] != nil
           - set(attributes["app_ns"],      resource.attributes["service.namespace"]) where resource.attributes["service.namespace"] != nil
+          - set(attributes["ecs_cluster"], resource.attributes["aws.ecs.cluster.name"]) where resource.attributes["aws.ecs.cluster.name"] != nil
+          - set(attributes["ecs_cluster"], resource.attributes["aws.ecs.cluster.arn"]) where attributes["ecs_cluster"] == nil and resource.attributes["aws.ecs.cluster.arn"] != nil
+          - replace_pattern(attributes["ecs_cluster"], "^arn:.*:cluster/", "") where attributes["ecs_cluster"] != nil
           - set(attributes["ecs_service"], resource.attributes["aws.ecs.service.name"]) where resource.attributes["aws.ecs.service.name"] != nil
           - set(attributes["ecs_task_family"], resource.attributes["aws.ecs.task.family"]) where resource.attributes["aws.ecs.task.family"] != nil
           - set(attributes["app_peer"], attributes["peer.service"]) where attributes["peer.service"] != nil
