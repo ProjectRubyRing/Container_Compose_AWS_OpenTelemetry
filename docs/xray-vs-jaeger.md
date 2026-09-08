@@ -14,6 +14,7 @@
 | front → back | `http://back:18080` | `http://localhost:18080` | 環境変数 1 つ |
 | Collector exporter | `otlp/jaeger` + `debug` | `awsxray` | 設定ファイル |
 | リソース検出 | `detectors: [env]` | `detectors: [env, ecs]` | 設定ファイル |
+| `aws.ecs.cluster.name` / `task.family` | `compose.yaml` が代替値を注入 | ecs ディテクタが自動取得 | 環境変数 1 つ |
 | 集中サンプリング | 無し (全量) | `awsproxy` + `sampler=xray` | 設定ファイル + 環境変数 |
 | 認証 | 不要 | ECS タスクロール | IAM |
 | トレース ID 形式 | 何でもよい | **先頭 4 バイトが epoch 秒** | ADOT エージェントが吸収 |
@@ -134,6 +135,98 @@ Jaeger にはこの区別が無い (リソース属性もタグとして検索�
 **ローカルでは transform が無くても動いてしまう**。
 だからこそローカルの Collector でも同じ transform を通し、
 「ローカルで見えた属性は X-Ray でも同じ名前で見える」状態を保っている。
+
+### ★`indexed_attributes` に書いてよい名前 / 書いても効かない名前
+
+`indexed_attributes` に列挙するのは **transform 後のスパン属性名**であって、
+`OTEL_RESOURCE_ATTRIBUTES` に入れたリソース属性名ではない。
+
+```yaml
+# 効かない (リソース属性名をそのまま書いている)
+indexed_attributes:
+  - service.namespace
+  - deployment.environment
+  - aws.ecs.cluster.name
+  - aws.ecs.service.name
+  - aws.ecs.task.family
+```
+
+これは**エラーにならず、annotation が付かないだけ**なので気づけない。
+本構成では次の対応表で運用する。左から右へ一意に辿れる。
+
+| 元のリソース属性 | 出どころ | transform 後のスパン属性 = annotation 名 | Jaeger のタグ検索 |
+|---|---|---|---|
+| `service.namespace` | `otel-env.sh` (`APP_NAMESPACE`) | `app_ns` | `app_ns=shopdemo` |
+| `deployment.environment(.name)` | `otel-env.sh` (`APP_ENV`) | `app_env` | `app_env=local` |
+| `app.service` | `otel-env.sh` (`APP_SERVICE`) | `app_service` | `app_service=intra-api` |
+| `app.role` | `otel-env.sh` (`APP_ROLE`) | `app_role` | `app_role=back` |
+| `aws.ecs.cluster.name` / `.arn` | 本番: ecs ディテクタ / ローカル: compose.yaml | `ecs_cluster` | `ecs_cluster=shopdemo-local` |
+| `aws.ecs.service.name` | `otel-env.sh` (`APP_SERVICE`) | `ecs_service` | `ecs_service=intra-api` |
+| `aws.ecs.task.family` | 本番: ecs ディテクタ / ローカル: compose.yaml | `ecs_task_family` | `ecs_task_family=intra-api-local` |
+
+X-Ray 側はこの右から 2 列目をそのまま使う。
+
+```
+annotation.app_ns          = "shopdemo"
+annotation.app_env         = "prd"
+annotation.app_role        = "back"
+annotation.ecs_cluster     = "shopdemo-prd"
+annotation.ecs_service     = "intra-api"
+annotation.ecs_task_family = "intra-api-prd"
+```
+
+#### `aws.ecs.cluster.name` は ecs ディテクタからは出ない
+
+ecs ディテクタが付けるのは **`aws.ecs.cluster.arn`** であり
+`aws.ecs.cluster.name` ではない。名前で索引したいので transform 側で
+ARN の末尾を切り出している (両 Collector 設定で同一)。
+
+```yaml
+- set(attributes["ecs_cluster"], resource.attributes["aws.ecs.cluster.name"]) where ...
+- set(attributes["ecs_cluster"], resource.attributes["aws.ecs.cluster.arn"])  where ...
+- replace_pattern(attributes["ecs_cluster"], "^arn:.*:cluster/", "") where ...
+```
+
+### ★これらの値をローカル (Jaeger) で確認する
+
+ecs ディテクタは Compose では外してある (メタデータエンドポイントが無く、
+毎回 5 秒タイムアウトする) ため、`aws.ecs.cluster.name` と
+`aws.ecs.task.family` だけがローカルで欠ける。
+`aws.ecs.service.name` は `otel-env.sh` が明示セットするので両環境で出る。
+
+欠ける 2 つは `compose.yaml` が `otel-env.sh` の既存フック
+`APP_EXTRA_RESOURCE_ATTRIBUTES` へ流し込んで埋めている。
+Compose サービスの追加も、シェル・イメージの変更も要らない。
+
+```yaml
+# compose.yaml (x-app-env)
+APP_EXTRA_RESOURCE_ATTRIBUTES: >-
+  aws.ecs.cluster.name=${ECS_CLUSTER_NAME:-${APP_NAMESPACE:-shopdemo}-local},aws.ecs.task.family=${ECS_TASK_FAMILY:-${APP_SERVICE:-intra-api}-local}...
+```
+
+確認手順:
+
+```sh
+docker compose up -d
+./scripts/smoke-trace.sh
+# Jaeger UI http://localhost:16686 -> Tags に下を 1 つずつ入れて絞り込む
+#   app_ns=shopdemo
+#   app_env=local
+#   app_role=back
+#   ecs_cluster=shopdemo-local
+#   ecs_service=intra-api
+#   ecs_task_family=intra-api-local
+```
+
+6 つすべてでトレースが引ければ、本番で `indexed_attributes` に
+`app_ns / app_env / app_role / ecs_cluster / ecs_service / ecs_task_family`
+を並べたときに annotation が入ることまで確認できたことになる。
+**Jaeger の Tags で引けないものは、X-Ray でも annotation にならない。**
+
+> Jaeger は「リソース属性も Process タグとして検索できてしまう」ため、
+> transform を通さずリソース属性のまま (`service.namespace` など) でも
+> 一見引ける。それは X-Ray では再現しない。上のフラットなキーで
+> 引けるかどうかだけを確認の基準にすること。
 
 ### annotation キーの文字制限
 

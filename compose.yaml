@@ -76,6 +76,24 @@ x-app-common: &app-common
     APP_NAMESPACE: ${APP_NAMESPACE:-shopdemo}
     APP_VERSION: ${APP_VERSION:-1.0.0}
 
+    # --- ECS ディテクタが本番でだけ付ける属性のローカル代替 -------------------
+    #  本番では Collector の resourcedetection(detectors: [env, ecs]) が
+    #  ECS タスクメタデータ v4 から aws.ecs.* を拾う。Compose には
+    #  169.254.170.2 が無いので ecs ディテクタを外してあり、
+    #      aws.ecs.cluster.name / aws.ecs.task.family
+    #  だけがローカルで欠ける (aws.ecs.service.name は otel-env.sh が
+    #  明示セットするので両環境で出る)。
+    #
+    #  ★ そのままだと Jaeger で ecs_cluster / ecs_task_family が空になり、
+    #    「X-Ray の indexed_attributes に並べた属性がローカルで検証できない」
+    #    状態になる。otel-env.sh に元からある追記フックへダミー値を流し込んで
+    #    埋める。イメージにもシェルにも手を入れない。
+    #
+    #  値は本番の命名に合わせてある (family = <APP_SERVICE>-<APP_ENV>)。
+    #  .env で上書きすれば本番と同じ文字列で検索の練習もできる。
+    APP_EXTRA_RESOURCE_ATTRIBUTES: >-
+      aws.ecs.cluster.name=${ECS_CLUSTER_NAME:-${APP_NAMESPACE:-shopdemo}-local},aws.ecs.task.family=${ECS_TASK_FAMILY:-${APP_SERVICE:-intra-api}-local}${APP_EXTRA_RESOURCE_ATTRIBUTES:+,${APP_EXTRA_RESOURCE_ATTRIBUTES}}
+
     # --- ADOT の関数レベル計装 (AWS Service Events) --------------------------
     #  空 = 使わない。otel-env.sh が
     #    OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED=false

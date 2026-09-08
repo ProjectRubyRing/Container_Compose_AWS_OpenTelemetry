@@ -8,6 +8,8 @@
 #  実行後、Jaeger UI (http://localhost:16686) で以下を確認する:
 #    - Service に intra-api-front / intra-api-back が出ている
 #    - Tags に app_service / app_role / app_caller / app_peer が入っている
+#    - X-Ray の indexed_attributes と同じ 6 つが引ける
+#        app_ns / app_env / app_role / ecs_cluster / ecs_service / ecs_task_family
 #    - 1 トレースの中に mysql / redis / http / sqs のスパンが並んでいる
 #
 #  ★ どの経路を叩くと X-Ray のどのノードが埋まるかを対応させてある。
@@ -76,6 +78,16 @@ cat <<'MSG'
    Tags 検索例  = app_caller=batch-ec2
                   app_peer=aurora-mysql
                   app_role=back
+
+ X-Ray の indexed_attributes をローカルで検証する (1 つずつ Tags に入れる):
+   app_ns=shopdemo            <- service.namespace   (APP_NAMESPACE)
+   app_env=local              <- deployment.environment (APP_ENV)
+   app_role=back              <- app.role            (APP_ROLE)
+   ecs_cluster=shopdemo-local <- aws.ecs.cluster.name
+   ecs_service=intra-api      <- aws.ecs.service.name
+   ecs_task_family=intra-api-local <- aws.ecs.task.family
+   ※ 引けないものは X-Ray でも annotation にならない。
+     詳細と対応表: docs/xray-vs-jaeger.md #3
 
  Collector が受信しているか:
    docker compose logs --tail=50 adot-collector
