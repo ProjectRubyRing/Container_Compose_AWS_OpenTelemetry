@@ -83,8 +83,17 @@ processors:
       span:
         - 'IsMatch(attributes["url.path"], "/api/health") and kind == 2'
         - 'IsMatch(attributes["http.target"], "/api/health") and kind == 2'
-        - 'attributes["http.request.header.x-app-caller"] == "healthcheck"'
-        - 'attributes["http.request.header.x_app_caller"] == "healthcheck"'
+        # ★ ヘッダ由来の属性は「文字列」ではなく「文字列の配列」で入る。
+        #   ヘッダは同名で複数回送れるため、計装が常に配列で持つのが理由。
+        #   したがって == で文字列と比べても **絶対に一致しない**。
+        #   エラーにもならず静かに素通りするので、
+        #   「フィルタを書いたのにヘルスチェックが落ちない」という形で
+        #   気づきにくく壊れる。IsMatch は配列を文字列化してから照合するので
+        #   ["healthcheck"] でも当たる。
+        #   (同じ理由で annotation へ昇格させるときは [0] で潰している。
+        #    X-Ray の annotation はスカラーしか受け付けない)
+        - 'IsMatch(attributes["http.request.header.x-app-caller"], "healthcheck")'
+        - 'IsMatch(attributes["http.request.header.x_app_caller"], "healthcheck")'
 
   # ---------------------------------------------------------------------------
   # 2. ECS のリソース情報を自動付与
@@ -104,6 +113,174 @@ processors:
     detectors: [env, ecs]
     timeout: 5s
     override: false
+
+  # ---------------------------------------------------------------------------
+  # 2.5 機密情報の伏せ字 / 取り込み禁止ヘッダの除去
+  #
+  #    ★ Collector が「X-Ray・Jaeger へ出る直前の最後の関所」になる。
+  #
+  #    【なぜアプリ側の許可リストだけでは足りないのか】
+  #      url.query と url.full は許可リストとは無関係に **既定で** スパンに付く。
+  #      署名付き URL やワンタイムトークンを URL に載せる相手を呼ぶと、
+  #      その値がそのままトレースに保存される。
+  #      エージェント側にも伏せ字機能はあるが OpenTelemetry Java 2.14.0 以降の
+  #      もので、本構成が固定している ADOT 2.11 系にはまだ入っていない。
+  #      したがってここで落とすのが本命になる。
+  #
+  #    【一度出したら消せない】
+  #      X-Ray に記録されたセグメントは個別に削除できない (保持期間が切れるまで
+  #      残る)。「後から気づいて消す」ができないので、送る前に落とす。
+  #
+  #    replace_pattern の第 3 引数の $${1} は「1 番目のキャプチャ」。
+  #    Collector の設定ファイルは ${...} を環境変数として展開するため、
+  #    リテラルの $ を書くには $$ と重ねる必要がある。
+  # ---------------------------------------------------------------------------
+  transform/redact-sensitive:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          # --- クエリ文字列の値を伏せる (キー名は残す = 何が渡ったかは分かる) ---
+          - replace_pattern(attributes["url.query"], "(?i)((?:^|&)(?:password|passwd|pwd|token|access_token|id_token|refresh_token|secret|client_secret|apikey|api_key|sig|signature|awsaccesskeyid|x-amz-signature|x-amz-credential|x-amz-security-token|x-goog-signature)=)[^&]*", "$${1}REDACTED") where attributes["url.query"] != nil
+          - replace_pattern(attributes["url.full"], "(?i)((?:[?&])(?:password|passwd|pwd|token|access_token|id_token|refresh_token|secret|client_secret|apikey|api_key|sig|signature|awsaccesskeyid|x-amz-signature|x-amz-credential|x-amz-security-token|x-goog-signature)=)[^&]*", "$${1}REDACTED") where attributes["url.full"] != nil
+          # --- 認証情報を含むヘッダは、万一取り込まれていても捨てる ---
+          #     otel-env.sh の APP_CAPTURE_HEADERS_DENY と同じ顔ぶれ。
+          #     アプリ側の設定を誰かが外しても、ここで止まる。
+          - delete_key(attributes, "http.request.header.authorization")
+          - delete_key(attributes, "http.request.header.proxy-authorization")
+          - delete_key(attributes, "http.request.header.cookie")
+          - delete_key(attributes, "http.request.header.x-api-key")
+          - delete_key(attributes, "http.request.header.x-amz-security-token")
+          - delete_key(attributes, "http.response.header.set-cookie")
+
+  # ---------------------------------------------------------------------------
+  # 2.6 peer.service の多段階判定 — ★ サービスマップの下流ノード名を決める
+  #
+  #    ★ ここが「マップに並ぶオブジェクトを読めるものにする」中核。
+  #
+  #    【X-Ray はノード名をどう決めているか】
+  #      awsxray exporter は CLIENT / PRODUCER / CONSUMER スパンの
+  #      セグメント名 (= サービスマップのノード名) を次の順で決める。
+  #
+  #        1. aws.remote.service        (Application Signals 用の属性)
+  #        2. peer.service             ★ 本構成が使うのはここ
+  #        3. aws.service / db.name@host / rpc.service / http.host
+  #        4. net.peer.name            (= 接続先 FQDN。既定はこれになる)
+  #        5. スパン名
+  #
+  #      何もしないと 4 に落ちて、
+  #        aurora-prd.cluster-abcdef.ap-northeast-1.rds.amazonaws.com
+  #      のような FQDN がノード名になる。環境ごとに文字列が違うので
+  #      dev と prd で同じ相手が別ノードに見え、マップが読めなくなる。
+  #
+  #    【エージェント側との役割分担】
+  #      接続先が環境変数で分かっているもの (Aurora / Valkey / ALB / SQS /
+  #      back) は、アプリ起動時に base/bin/otel-env.sh が
+  #      peer-service-mapping を組み立てて peer.service を付ける。
+  #      ここへ来るのは **エージェントが決められなかったスパン** だけ:
+  #        - 運用中に足された連携先
+  #        - AWS SDK が内部で叩く別サービス
+  #        - IP 直指定 / 動的に変わる FQDN
+  #      判定の段と規則は otel-env.sh と同じものを使う。片方だけ直すと
+  #      「アプリ再起動までは Collector 版、再起動後はエージェント版」と
+  #      いう分かりにくいズレが出るので、必ず両方そろえて直すこと。
+  #
+  #    【判定の段】 (上から順に評価し、決まったら以降は素通り)
+  #      agent    エージェントが既に決めた             app_peer_src=agent
+  #      domain   ホスト名の部分一致                   app_peer_src=domain
+  #      port     ポート番号                           app_peer_src=port
+  #      aws      AWS SDK 計装の属性から              app_peer_src=aws
+  #      host     どれも当たらず接続先ホストをそのまま app_peer_src=host
+  #
+  #      どの段で決まったかは annotation app_peer_src に残す。
+  #      「このノード名はどこから来たのか」を X-Ray / Jaeger だけで辿れる。
+  #        annotation.app_peer_src = "host"  で絞れば
+  #        「名前を付け損ねている相手」だけを一覧できる。
+  # ---------------------------------------------------------------------------
+  transform/peer-service-resolve:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          # --- (0) 接続先のホストとポートを 1 か所に正規化する -----------------
+          #     semconv の新旧でキーが違う (server.* が新 / net.peer.* が旧)。
+          #     どちらの版のエージェントでも同じ判定が効くようにここで揃える。
+          #     対象は下流を指すスパンだけ (CLIENT=3 / PRODUCER=4 / CONSUMER=5)。
+          - set(attributes["app_peer_host"], attributes["server.address"]) where (kind == 3 or kind == 4 or kind == 5) and attributes["server.address"] != nil
+          - set(attributes["app_peer_host"], attributes["net.peer.name"]) where (kind == 3 or kind == 4 or kind == 5) and attributes["app_peer_host"] == nil and attributes["net.peer.name"] != nil
+          - set(attributes["app_peer_host"], attributes["network.peer.address"]) where (kind == 3 or kind == 4 or kind == 5) and attributes["app_peer_host"] == nil and attributes["network.peer.address"] != nil
+          - set(attributes["app_peer_port"], attributes["server.port"]) where attributes["app_peer_host"] != nil and attributes["server.port"] != nil
+          - set(attributes["app_peer_port"], attributes["net.peer.port"]) where attributes["app_peer_host"] != nil and attributes["app_peer_port"] == nil and attributes["net.peer.port"] != nil
+
+          # --- 段0/1: エージェントが決めた分にはこれ以上手を入れない ----------
+          - set(attributes["app_peer_src"], "agent") where attributes["peer.service"] != nil
+
+          # --- 段2: ドメイン部分一致 -------------------------------------------
+          #     FQDN 全体ではなく「含まれていれば当たる」判定にしてある。
+          #     dev / stg / prd でエンドポイントが変わっても追随不要。
+          #     otel-env.sh の APP_PEER_DOMAIN_RULES と同じ顔ぶれ。
+          - set(attributes["peer.service"], "aurora-mysql") where attributes["peer.service"] == nil and attributes["app_peer_host"] != nil and IsMatch(attributes["app_peer_host"], "\\.rds\\.amazonaws\\.com$")
+          - set(attributes["peer.service"], "elasticache-valkey") where attributes["peer.service"] == nil and attributes["app_peer_host"] != nil and IsMatch(attributes["app_peer_host"], "\\.cache\\.amazonaws\\.com$")
+          - set(attributes["peer.service"], "alb") where attributes["peer.service"] == nil and attributes["app_peer_host"] != nil and IsMatch(attributes["app_peer_host"], "\\.elb\\.amazonaws\\.com$")
+          - set(attributes["peer.service"], "sqs") where attributes["peer.service"] == nil and attributes["app_peer_host"] != nil and IsMatch(attributes["app_peer_host"], "^sqs\\.")
+          - set(attributes["peer.service"], "s3") where attributes["peer.service"] == nil and attributes["app_peer_host"] != nil and IsMatch(attributes["app_peer_host"], "(^|\\.)s3[.-]")
+          - set(attributes["peer.service"], "api-gateway") where attributes["peer.service"] == nil and attributes["app_peer_host"] != nil and IsMatch(attributes["app_peer_host"], "\\.execute-api\\.")
+          - set(attributes["peer.service"], "secretsmanager") where attributes["peer.service"] == nil and attributes["app_peer_host"] != nil and IsMatch(attributes["app_peer_host"], "\\.secretsmanager\\.")
+          - set(attributes["peer.service"], "ecr") where attributes["peer.service"] == nil and attributes["app_peer_host"] != nil and IsMatch(attributes["app_peer_host"], "\\.dkr\\.ecr\\.")
+          - set(attributes["app_peer_src"], "domain") where attributes["peer.service"] != nil and attributes["app_peer_src"] == nil
+
+          # --- 段3: ポート番号 --------------------------------------------------
+          #     ホスト名から何も分からない相手 (IP 直指定 / localhost /
+          #     社内 FQDN) 向け。ECS のタスク内は front も back も ADOT
+          #     サイドカーも同じ localhost なので、ポートでしか区別できない。
+          #     otel-env.sh の APP_PEER_PORT_RULES と同じ顔ぶれ。
+          - set(attributes["peer.service"], "aurora-mysql") where attributes["peer.service"] == nil and attributes["app_peer_port"] == 3306
+          - set(attributes["peer.service"], "elasticache-valkey") where attributes["peer.service"] == nil and attributes["app_peer_port"] == 6379
+          - set(attributes["peer.service"], "adot-collector") where attributes["peer.service"] == nil and attributes["app_peer_port"] == 4317
+          - set(attributes["peer.service"], "adot-collector") where attributes["peer.service"] == nil and attributes["app_peer_port"] == 4318
+          - set(attributes["peer.service"], "adot-awsproxy") where attributes["peer.service"] == nil and attributes["app_peer_port"] == 2000
+          - set(attributes["app_peer_src"], "port") where attributes["peer.service"] != nil and attributes["app_peer_src"] == nil
+
+          # --- 段4: AWS 自動判定 ------------------------------------------------
+          #     AWS SDK の計装が付ける属性から機械的に決める。
+          #       rpc.system = aws-api のとき rpc.service に "Sqs" のような
+          #       サービス名が入る。ホスト名を見るより確実。
+          #     messaging.system (aws.sqs 等) と db.system も同じ用途に使える。
+          - set(attributes["peer.service"], attributes["rpc.service"]) where attributes["peer.service"] == nil and attributes["rpc.system"] == "aws-api" and attributes["rpc.service"] != nil
+          - set(attributes["peer.service"], attributes["messaging.system"]) where attributes["peer.service"] == nil and attributes["messaging.system"] != nil
+          - set(attributes["peer.service"], attributes["db.system"]) where attributes["peer.service"] == nil and attributes["db.system"] != nil
+          - set(attributes["app_peer_src"], "aws") where attributes["peer.service"] != nil and attributes["app_peer_src"] == nil
+
+          # --- 段5: 最後の受け皿 (接続先ホストをそのまま) ----------------------
+          #     ここに落ちたスパンは「名前を付け損ねている相手」。
+          #     annotation.app_peer_src = "host" で一覧できるようにしておき、
+          #     見つけたら otel-env.sh か上の段2/3 にルールを足す。
+          - set(attributes["peer.service"], attributes["app_peer_host"]) where attributes["peer.service"] == nil and attributes["app_peer_host"] != nil
+          - set(attributes["app_peer_src"], "host") where attributes["peer.service"] != nil and attributes["app_peer_src"] == nil
+
+          # --- ALB を挟んでいるかの印 ------------------------------------------
+          #     ★ ALB は X-Ray にセグメントを送らない。ALB のノードが自動で
+          #       生えてくることは無い。「この通信が ALB 越しかどうか」は
+          #       こちら側で印を付けておくしかない (docs/alb-tracing.md)。
+          #
+          #       クライアント側: 接続先が *.elb.amazonaws.com、または
+          #                       peer.service が -alb で終わる
+          #       サーバ側      : X-Forwarded-For が付いている
+          #                       (ALB / プロキシを通ったリクエストにだけ付く)
+          - set(attributes["app_via"], "alb") where attributes["app_peer_host"] != nil and IsMatch(attributes["app_peer_host"], "\\.elb\\.amazonaws\\.com$")
+          - set(attributes["app_via"], "alb") where attributes["app_via"] == nil and attributes["peer.service"] != nil and IsMatch(attributes["peer.service"], "-alb$")
+          - set(attributes["app_via"], "alb") where attributes["app_via"] == nil and kind == 2 and attributes["http.request.header.x-forwarded-for"] != nil
+
+          # --- ALB の裏で実際に応答したサーバ ----------------------------------
+          #     ★ ALB 自身は「どのターゲットが応答したか」を返さない。
+          #       ターゲット側が X-Server-Id 等を返す実装なら ALB は素通しする
+          #       ので、クライアントのレスポンスヘッダとして拾える。
+          #       これがあると front -> report-ec2 のエッジ 1 本しか無くても
+          #       「どの EC2 が遅いのか」まで絞り込める。
+          #       (ターゲットが何も返さない場合は当然埋まらない)
+          - set(attributes["app_upstream"], attributes["http.response.header.x-server-id"]) where attributes["http.response.header.x-server-id"] != nil
+          - set(attributes["app_upstream"], attributes["http.response.header.x-backend-server"]) where attributes["app_upstream"] == nil and attributes["http.response.header.x-backend-server"] != nil
+          - set(attributes["app_upstream"], attributes["app_upstream"][0]) where IsList(attributes["app_upstream"])
 
   # ---------------------------------------------------------------------------
   # 3. X-Ray の annotation 用にリソース属性をスパンへ写す
@@ -178,6 +355,66 @@ processors:
           #     「バッチ由来を除いた利用者トラフィックだけ」の検索ができる。
           - set(attributes["app_caller"], "user") where attributes["app_caller"] == nil and kind == 2
 
+          # --- 下流ノード名がどの段で決まったか ---------------------------------
+          #     transform/peer-service-resolve が付ける。
+          #       agent  … アプリの peer-service-mapping (接続先が既知)
+          #       domain … ホスト名の部分一致
+          #       port   … ポート番号
+          #       aws    … AWS SDK 計装の属性
+          #       host   … どれも当たらず FQDN のまま (= ルールの付け忘れ)
+          #     annotation.app_peer_src = "host" で「名前を付け損ねている相手」
+          #     だけを一覧できる。マップを綺麗に保つための宿題リストになる。
+          #
+          #     app_peer_src / app_via / app_upstream は
+          #     transform/peer-service-resolve が既にスパン属性として付けている。
+          #     ここで写し替える必要は無く、awsxray の indexed_attributes に
+          #     名前を並べるだけで annotation になる (下の exporters を参照)。
+          #     Jaeger では加工なしでそのまま Tags に出る。
+
+          # --- 実クライアント IP (ALB の手前) -----------------------------------
+          #     ★ ALB を挟むと http.client_ip は ALB の IP になる。
+          #       利用者の IP は X-Forwarded-For の **先頭** にしか無い。
+          #       ヘッダ由来の値は文字列配列で入るので先頭要素へ潰し、
+          #       さらに "client, proxy1, proxy2" の先頭だけを切り出す。
+          - set(attributes["client_ip"], attributes["http.request.header.x-forwarded-for"]) where attributes["http.request.header.x-forwarded-for"] != nil
+          - set(attributes["client_ip"], attributes["client_ip"][0]) where IsList(attributes["client_ip"])
+          - replace_pattern(attributes["client_ip"], ",.*$", "") where attributes["client_ip"] != nil
+          - replace_pattern(attributes["client_ip"], "^\\s+", "") where attributes["client_ip"] != nil
+
+          # --- 利用者側が HTTPS だったか (ALB で TLS 終端するので中は常に http) -
+          - set(attributes["client_proto"], attributes["http.request.header.x-forwarded-proto"]) where attributes["http.request.header.x-forwarded-proto"] != nil
+          - set(attributes["client_proto"], attributes["client_proto"][0]) where IsList(attributes["client_proto"])
+
+          # --- どのドメインで受けたか (同じ ALB に複数ドメインを載せる構成用) ---
+          - set(attributes["http_host"], attributes["http.request.header.host"]) where attributes["http.request.header.host"] != nil
+          - set(attributes["http_host"], attributes["http_host"][0]) where IsList(attributes["http_host"])
+
+          # --- 呼び出し元が採番した ID (ログ突き合わせ用) ------------------------
+          - set(attributes["request_id"], attributes["http.request.header.x-request-id"]) where attributes["http.request.header.x-request-id"] != nil
+          - set(attributes["request_id"], attributes["request_id"][0]) where IsList(attributes["request_id"])
+
+          # --- ALB が採番したトレース ID ----------------------------------------
+          #     ★ ALB アクセスログの trace_id 列と突き合わせるための鍵。
+          #       X-Ray のトレース ID とは別物 (Root=1-... の文字列そのもの)。
+          #       ALB のログには request_processing_time /
+          #       target_processing_time が出るので、これを結合キーにすれば
+          #       「ALB で待たされたのか、EC2 が遅いのか」を分離できる。
+          #       X-Ray だけでは分離できない情報なので、必ず残しておく。
+          - set(attributes["alb_trace_id"], attributes["http.request.header.x-amzn-trace-id"]) where attributes["http.request.header.x-amzn-trace-id"] != nil
+          - set(attributes["alb_trace_id"], attributes["alb_trace_id"][0]) where IsList(attributes["alb_trace_id"])
+
+          # --- 取り込んだリクエストパラメータ ------------------------------------
+          #     ★ servlet の capture-request-parameters は
+          #       servlet.request.parameter.<名前> という **文字列配列** で入る。
+          #       X-Ray の annotation はスカラーしか受け付けないため、
+          #       配列のままでは検索できる annotation にならない (metadata 行き)。
+          #       検索したい 1 つだけをここでスカラーへ落として昇格させる。
+          #       増やす場合はこの 3 行を複製し、indexed_attributes にも足すこと。
+          #       ★ 個人情報を annotation にすると X-Ray の検索インデックスに
+          #         残る。業務キー (注文番号など) 以外は昇格させないこと。
+          - set(attributes["app_param"], attributes["servlet.request.parameter.orderid"]) where attributes["servlet.request.parameter.orderid"] != nil
+          - set(attributes["app_param"], attributes["app_param"][0]) where IsList(attributes["app_param"])
+
   # ---------------------------------------------------------------------------
   # 4. バッチ送信
   #    X-Ray の PutTraceSegments 呼び出し回数を抑える。
@@ -203,12 +440,26 @@ exporters:
   awsxray:
     region: ${env:AWS_REGION}
     indexed_attributes:
+      # --- どのサービス / どのコンテナ / どの環境か ---
       - app_service
       - app_role
       - app_env
       - app_ns
-      - app_peer
-      - app_caller
+      # --- 相手は誰か / 誰に呼ばれたか ---
+      - app_peer          # 下流の論理名 (= サービスマップのノード名)
+      - app_peer_src      # その名前がどの段で決まったか (agent/domain/port/aws/host)
+      - app_caller        # 呼び出し元 (batch-ec2 / lambda-sqs / user / healthcheck)
+      # --- ALB 越しの通信を追うための 5 つ ---
+      - app_via           # "alb" なら ALB (プロキシ) を通っている
+      - app_upstream      # ALB の裏で実際に応答したサーバ (名乗ってくれた場合)
+      - client_ip         # ALB の手前の実クライアント IP (X-Forwarded-For の先頭)
+      - client_proto      # 利用者側が http か https か (ALB で TLS 終端するため)
+      - http_host         # 受けたドメイン (1 つの ALB に複数ドメインを載せる構成用)
+      - alb_trace_id      # ALB が採番した X-Amzn-Trace-Id (ALB アクセスログとの結合キー)
+      # --- リクエストの中身 ---
+      - request_id        # 呼び出し元が採番した ID (アプリログとの結合キー)
+      - app_param         # 取り込んだリクエストパラメータのうち検索したい 1 つ
+      # --- ECS のどこで動いていたか ---
       - ecs_cluster
       - ecs_service
       - ecs_task_family
@@ -232,6 +483,8 @@ service:
       processors:
         - filter/drop-healthcheck
         - resourcedetection          # ★XRAY-DIFF: detectors に ecs を含む
+        - transform/redact-sensitive       # 秘匿情報を落とす (最初に通す)
+        - transform/peer-service-resolve   # 下流ノード名の多段階判定
         - transform/xray-annotations
         - batch/traces
       exporters: [awsxray]           # ★XRAY-DIFF: 送信先

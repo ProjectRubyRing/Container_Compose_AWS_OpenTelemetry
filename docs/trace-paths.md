@@ -96,9 +96,19 @@ X-Ray からキャッシュアクセスが丸ごと消える。
 | 伝播 | `traceparent` + `X-Amzn-Trace-Id` を送出。ALB は両方素通し |
 | 設定 | `REPORT_ALB_HOST`, `REPORT_ALB_URL` |
 
-**X-Ray での見え方**: `report-ec2` という下流ノード。
+**X-Ray での見え方**: `report-ec2` という下流ノード
+(`APP_PEER_ALB_MODE=alb` にすると `report-alb`)。
 帳票 EC2 が計装されていないので、**そのノードの内側は見えない**
 (帳票生成に何秒かかったかは分かるが、その内訳は分からない)。
+
+**★ ALB のノードは出ない。** ALB は API Gateway と違い X-Ray に
+セグメントを送らないため、マップに出るのはこちらのクライアントスパンが
+作る推定ノード 1 個だけ。ALB での待ちとターゲットの処理時間は
+X-Ray 単体では分離できない。分離したいときは `alb_trace_id` annotation を
+キーに ALB アクセスログの `target_processing_time` と突き合わせる。
+どの EC2 が応答したかは、ターゲットが `X-Server-Id` を返せば
+`app_upstream` annotation で分かる。
+→ [`docs/alb-tracing.md`](alb-tracing.md)
 
 **帳票 EC2 も計装したい場合**:
 同じ ADOT Java Agent を EC2 上の JVM に入れる。EC2 に ADOT Collector を
@@ -106,11 +116,17 @@ X-Ray からキャッシュアクセスが丸ごと消える。
 コンテナ側と揃えれば 1 本のトレースとして繋がる。
 
 ```sh
-export OTEL_SERVICE_NAME=report-ec2
+export OTEL_SERVICE_NAME=report-ec2                 # ★ peer.service と同じ文字列に
 export OTEL_PROPAGATORS=xray,tracecontext,baggage   # ★ 必ず揃える
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 java -javaagent:/opt/aws/aws-opentelemetry-agent.jar -jar report.jar
 ```
+
+★ `OTEL_SERVICE_NAME` はこちらの `peer.service` と **同じ文字列**にすること。
+X-Ray は名前が一致するノードを 1 つに束ねるので、違うと
+`report-ec2` と `report-alb` のように同じ相手が 2 ノードに割れる。
+したがって EC2 を計装するなら `APP_PEER_ALB_MODE` は既定の `upstream`
+のままにする (`alb` と併用しない)。
 
 ---
 
@@ -138,7 +154,7 @@ java -javaagent:/opt/aws/aws-opentelemetry-agent.jar -jar report.jar
 
 **誰が叩いたかを分かるようにする**:
 バッチが `X-App-Caller: batch-ec2` ヘッダを付ける。コンテナ側は
-`OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS=x-app-caller` で
+`OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS` で
 スパン属性に取り込み、Collector が annotation `app_caller` に昇格させる。
 
 ```
@@ -147,6 +163,18 @@ annotation.app_caller = "batch-ec2"
 
 これでバッチ由来のトレースだけを一覧できる。
 ALB を挟むと呼び出し元が分からなくなる問題への、コードを触らない答え。
+
+ALB が付けるヘッダも同じ仕組みで取り込んであるので、
+呼び出し元がヘッダを付けてくれない場合でもここまでは分かる。
+
+```
+annotation.app_via      = "alb"          # ALB を通ってきた
+annotation.client_ip    = "203.0.113.10" # ALB の手前の実クライアント IP
+annotation.client_proto = "https"        # 利用者側は HTTPS だった
+annotation.alb_trace_id = "Root=1-..."   # ALB アクセスログとの結合キー
+```
+
+→ 取り込むヘッダの一覧と足し方: [`docs/request-attributes.md`](request-attributes.md)
 
 **バッチも計装する場合 (推奨)**: 経路 4 と同じ手順。
 バッチ自身のノードがサービスマップに出るようになる。
@@ -242,6 +270,7 @@ X-Ray 上で **トレースが 2 本に割れる**:
 | 経路 | 依存している設定 | 外すとどうなるか |
 |---|---|---|
 | front→back | `OTEL_PROPAGATORS` に `tracecontext` | トレースが割れる |
+| front→back (ECS) | `peer-service-mapping` が `localhost:18080` とポート付きであること | ADOT サイドカーまで back と名乗る |
 | →Aurora | `peer-service-mapping` の `DB_HOST` | ノード名が FQDN になる |
 | →Aurora | `JDBC_DATASOURCE_ENABLED` | プール待ちが見えない |
 | →Valkey | Jedis / Lettuce を使うこと | スパンが一切出ない |
@@ -249,4 +278,7 @@ X-Ray 上で **トレースが 2 本に割れる**:
 | バッチ→ | `OTEL_PROPAGATORS` に `xray` | トレースが割れる |
 | バッチ→ | `capture-request-headers` | 呼び出し元が分からない |
 | →SQS→Lambda | `USE_PROPAGATOR_FOR_MESSAGING` | トレースが 2 本に割れる |
+| ALB 経由 | ターゲットが `X-Server-Id` を返すこと | どの EC2 が応答したか分からない |
+| 全経路 | Collector の `transform/peer-service-resolve` | 未知の接続先が FQDN のまま出る |
+| 全経路 | Collector の `transform/redact-sensitive` | URL のトークンがトレースに保存される |
 | 全経路 | ADOT 版エージェント | X-Ray が ID を捨てる (Jaeger では動く) |

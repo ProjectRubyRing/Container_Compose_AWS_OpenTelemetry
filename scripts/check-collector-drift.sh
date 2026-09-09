@@ -16,8 +16,16 @@
 #
 #  比較対象:
 #    - filter/drop-healthcheck の条件
+#    - transform/redact-sensitive の statements     (秘匿情報の伏せ字)
+#    - transform/peer-service-resolve の statements (下流ノード名の多段階判定)
 #    - transform/xray-annotations の statements
 #    - batch/traces の設定
+#
+#  ★ peer-service-resolve は特にずれやすい。
+#    「ローカルでは aurora-mysql なのに X-Ray では FQDN のまま」という
+#    形で本番でだけ壊れる。判定規則を足したら必ず両方に入れること。
+#    (アプリ側 base/bin/otel-env.sh の APP_PEER_DOMAIN_RULES /
+#     APP_PEER_PORT_RULES とも顔ぶれをそろえる)
 #
 #  意図的に違う箇所 (★XRAY-DIFF コメントが付いている行) は比較しない。
 # =============================================================================
@@ -47,7 +55,9 @@ extract() {
 }
 
 rc=0
-for block in "filter/drop-healthcheck:" "transform/xray-annotations:" "batch/traces:"; do
+for block in "filter/drop-healthcheck:" "transform/redact-sensitive:" \
+             "transform/peer-service-resolve:" "transform/xray-annotations:" \
+             "batch/traces:"; do
     ta=$(extract "$A" "$block")
     tb=$(extract "$B" "$block")
     if [ "$ta" = "$tb" ]; then
