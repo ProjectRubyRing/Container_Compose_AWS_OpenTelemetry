@@ -224,58 +224,335 @@ if [ -n "${OTEL_TRACES_SAMPLER_ARG:-}" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 6. peer.service マッピング — ★ X-Ray サービスマップの「下流ノード名」を作る
+# 6. peer.service の多段階判定 — ★ X-Ray サービスマップの「下流ノード名」を作る
 #
-#    計装されていない相手 (Aurora / Valkey / 帳票 EC2 / 外部 SLB) は、
+#    計装されていない相手 (Aurora / Valkey / 帳票 EC2 / 外部 SLB / ALB) は、
 #    こちらのクライアントスパンから推測された名前でマップに出る。既定では
 #      aurora-xxx.cluster-xxxxxxxx.ap-northeast-1.rds.amazonaws.com
 #    のような FQDN がそのままノード名になり、マップが読めなくなる。
 #
 #    OpenTelemetry Java Agent の peer-service-mapping は
-#    「接続先ホスト -> 論理名」の対応表を環境変数だけで与えられる。アプリの
+#    「接続先 -> 論理名」の対応表を環境変数だけで与えられる。アプリの
 #    コードを 1 行も触らずにマップのノード名を運用上の呼び名へ揃えられる。
 #
-#      書式: <host or ip>=<peer.service>,<host>=<peer.service>,...
+#      書式: <host>=<name>,<host>:<port>=<name>,<host>:<port>/<path>=<name>
 #      対象: JDBC / Redis(Valkey) / HTTP クライアント / gRPC すべて
+#      ★ host:port 形式は Java Agent 1.31.0 以降で使える。本構成が使う
+#        ADOT 2.x は当然含む。ホスト名だけの照合しかできなかった頃の
+#        制約 (下の「localhost 問題」) はこれで解消している。
 #
-#    ここでは「接続先ホスト名を持つ環境変数」から自動生成する。ホスト名は
-#    Compose と ECS で当然変わるが、この導出ロジックは変わらない。
+#   ---------------------------------------------------------------------------
+#   判定は 5 段。上の段で決まったらそこで打ち切る
+#   ---------------------------------------------------------------------------
+#     段0  明示     APP_PEER_SERVICE_MAPPING に運用が直接書いた対応
+#     段1  役割     変数名から用途が確定しているもの (DB_HOST -> aurora-mysql)
+#     段2  ドメイン ホスト名の部分一致 (.rds.amazonaws.com -> aurora-mysql)
+#     段3  ポート   ポート番号 (3306 -> aurora-mysql)
+#     段4  AWS 自動 *.<service>.amazonaws.com からサービス名を機械的に抜く
+#     (どれも当たらなければマッピングを出さない = FQDN のまま出る)
+#
+#   段0/段1 は「この環境変数が何を指すか」を知っているので最も確度が高い。
+#   段2 以降は用途が未知のホスト (運用中に足された連携先、AWS の別サービス、
+#   マルチ AZ で FQDN が変わる相手) のための機械的な判定で、
+#   **同じ順番・同じルールを ADOT Collector 側にも置いてある**
+#   (otel/collector-*.yaml の transform/peer-service-resolve)。
+#   エージェントが決められなかったスパンは Collector が同じ規則で決める。
+#   どの段で決まったかは
+#       - 起動ログ ([otel-env] peer-service サマリ)         … 段0〜4
+#       - スパン属性 app_peer_src (annotation にも昇格)     … Collector 側
+#   の 2 か所で確認できる。「なぜこのノード名になったのか」を追えるようにする
+#   ためだけの仕組みなので、消してもトレース自体は壊れない。
+#
+#   ---------------------------------------------------------------------------
+#   ALB をどう見せるか (APP_PEER_ALB_MODE)
+#   ---------------------------------------------------------------------------
+#     upstream (既定) ALB を透過扱いし、ALB の裏にいる実サービス名を使う。
+#                     例: REPORT_ALB_HOST -> report-ec2
+#                     マップは front -> report-ec2 の 1 エッジになる。
+#     alb             ALB 自体をノードにする。例: -> report-alb
+#                     マップは front -> report-alb で止まる。
+#                     「どの ALB で詰まっているか」を見たいときはこちら。
+#
+#   ★ ALB は X-Ray にセグメントを送らない (API Gateway と違い、ALB 自身の
+#     ノードは AWS 側からは作られない)。上のどちらを選んでも、マップに出る
+#     ノードは「こちらのクライアントスパンが作った推定ノード」1 個だけで、
+#     ALB とターゲットの内訳は分離できない。分離したいなら
+#       (a) ターゲット (EC2) 側にも同じ ADOT Java Agent を入れる
+#           = アプリ改修なし・自動計装だけで実サーバのノードが増える
+#       (b) ALB アクセスログ (target_processing_time) と突き合わせる
+#     の 2 通り。詳細と手順は docs/alb-tracing.md。
+#     (a) を採るときは peer.service を EC2 側の OTEL_SERVICE_NAME と
+#     **同じ文字列**にすること。違うと同じ相手が 2 ノードに割れる。
 # -----------------------------------------------------------------------------
-otel_peer_add() {
-    # $1 = ホスト (空なら何もしない) / $2 = 論理名
-    [ -n "${1:-}" ] || return 0
-    if [ -n "${_peer}" ]; then _peer="${_peer},$1=$2"; else _peer="$1=$2"; fi
+: "${APP_PEER_ALB_MODE:=upstream}"
+case "${APP_PEER_ALB_MODE}" in
+    upstream|alb) ;;
+    *) otel_die "APP_PEER_ALB_MODE の値が不正です: [${APP_PEER_ALB_MODE}] / upstream または alb を指定してください。" 45 ;;
+esac
+
+# --- 段2 のルール: <ホスト名の部分文字列>=<論理名> ----------------------------
+#   ホスト名に「含まれていれば」当たる。FQDN 全体を書かなくてよいので、
+#   dev/stg/prd でエンドポイントが変わっても 1 行で追随できる。
+#   前から順に評価し、最初に当たったものを採用する。
+: "${APP_PEER_DOMAIN_RULES:=.rds.amazonaws.com=aurora-mysql,.cache.amazonaws.com=elasticache-valkey,.elb.amazonaws.com=alb,sqs.=sqs,.s3.=s3,s3.=s3,.execute-api.=api-gateway,.secretsmanager.=secretsmanager,.dkr.ecr.=ecr}"
+
+# --- 段3 のルール: <ポート番号>=<論理名> --------------------------------------
+#   ホスト名から何も分からない相手 (IP 直指定 / localhost / 社内 FQDN) 向け。
+#   ★ ECS のタスク内は front も back も ADOT サイドカーも同じ localhost なので、
+#     ポートでしか区別できない。ここが host:port 形式の一番の使いどころ。
+: "${APP_PEER_PORT_RULES:=3306=aurora-mysql,6379=elasticache-valkey,4317=adot-collector,4318=adot-collector,2000=adot-awsproxy}"
+
+# --- 段4: AWS 自動判定 --------------------------------------------------------
+#   *.amazonaws.com のホスト名から AWS のサービス名トークンを機械的に抜く。
+#     sqs.ap-northeast-1.amazonaws.com          -> sqs
+#     bucket.s3.ap-northeast-1.amazonaws.com    -> s3
+#     abc.ap-northeast-1.elb.amazonaws.com      -> elb
+#   段2 のルールに載っていない AWS サービスを足したときに、FQDN が
+#   そのままノード名になるのを防ぐための最後の受け皿。
+: "${APP_PEER_AWS_AUTO:=true}"
+
+# -----------------------------------------------------------------------------
+#  ヘルパー
+# -----------------------------------------------------------------------------
+
+# URL からホストを取り出す (http://host:port/path -> host)
+otel_url_host() {
+    _u="${1#*://}"; _u="${_u%%/*}"; _u="${_u%%\?*}"
+    case "${_u}" in *@*) _u="${_u##*@}" ;; esac
+    case "${_u}" in
+        \[*\]*) echo "${_u%%\]*}]" ;;   # IPv6 リテラル
+        *:*)    echo "${_u%%:*}" ;;
+        *)      echo "${_u}" ;;
+    esac
+    unset _u
 }
 
+# URL からポートを取り出す (省略時はスキームの既定値)
+otel_url_port() {
+    _s="${1%%://*}"; _u="${1#*://}"; _u="${_u%%/*}"; _u="${_u%%\?*}"
+    case "${_u}" in *@*) _u="${_u##*@}" ;; esac
+    case "${_u}" in
+        \[*\]:*) echo "${_u##*\]:}" ; unset _s _u ; return 0 ;;
+        \[*\])   : ;;
+        *:*)     echo "${_u##*:}" ; unset _s _u ; return 0 ;;
+    esac
+    case "${_s}" in
+        https|wss) echo 443 ;;
+        http|ws)   echo 80 ;;
+        *)         echo "" ;;
+    esac
+    unset _s _u
+}
+
+# 段2: ドメイン部分一致。当たれば論理名を stdout へ、外れれば 1 を返す。
+otel_peer_by_domain() {
+    [ -n "${1:-}" ] || return 1
+    for _r in $(echo "${APP_PEER_DOMAIN_RULES}" | tr ',' ' '); do
+        _frag="${_r%%=*}"; _name="${_r#*=}"
+        [ -n "${_frag}" ] && [ "${_frag}" != "${_r}" ] || continue
+        case "$1" in
+            *"${_frag}"*) echo "${_name}"; unset _r _frag _name; return 0 ;;
+        esac
+    done
+    unset _r _frag _name
+    return 1
+}
+
+# 段3: ポート番号一致。
+otel_peer_by_port() {
+    [ -n "${1:-}" ] || return 1
+    for _r in $(echo "${APP_PEER_PORT_RULES}" | tr ',' ' '); do
+        _p="${_r%%=*}"; _name="${_r#*=}"
+        [ -n "${_p}" ] && [ "${_p}" != "${_r}" ] || continue
+        if [ "$1" = "${_p}" ]; then echo "${_name}"; unset _r _p _name; return 0; fi
+    done
+    unset _r _p _name
+    return 1
+}
+
+# 段4: *.amazonaws.com からサービス名トークンを抜く。
+#   最後の "amazonaws.com" を落とし、残りの末尾ラベルのうち
+#   リージョン名 (ap-northeast-1 のような形) を読み飛ばした先を採る。
+otel_peer_by_aws() {
+    [ "${APP_PEER_AWS_AUTO}" = "true" ] || return 1
+    case "${1:-}" in *.amazonaws.com) ;; *) return 1 ;; esac
+    _rest="${1%.amazonaws.com}"
+    while [ -n "${_rest}" ]; do
+        _tok="${_rest##*.}"
+        case "${_tok}" in
+            # リージョン (ap-northeast-1 / us-east-2 ...) と汎用ラベルは読み飛ばす
+            [a-z][a-z]-*-[0-9]|[a-z][a-z]-[a-z]*-[0-9]|api|vpce|cn|dualstack) ;;
+            "") ;;
+            *) echo "${_tok}"; unset _rest _tok; return 0 ;;
+        esac
+        case "${_rest}" in *.*) _rest="${_rest%.*}" ;; *) _rest="" ;; esac
+    done
+    unset _rest _tok
+    return 1
+}
+
+# 多段階判定の本体。
+#   $1 = ホスト / $2 = ポート (空可) / $3 = 段1 の役割既定名 (空可)
+#   決まったら "<name> <stage>" を stdout へ、決まらなければ 1 を返す。
+otel_peer_resolve() {
+    _h="${1:-}"; _pt="${2:-}"; _role_default="${3:-}"
+    [ -n "${_h}" ] || { unset _h _pt _role_default; return 1; }
+
+    # 段0: 運用が名指しした対応 (host:port を優先し、無ければ host)
+    for _r in $(echo "${APP_PEER_SERVICE_MAPPING:-}" | tr ',' ' '); do
+        _k="${_r%%=*}"; _v="${_r#*=}"
+        [ -n "${_k}" ] && [ "${_k}" != "${_r}" ] || continue
+        if [ -n "${_pt}" ] && [ "${_k}" = "${_h}:${_pt}" ]; then
+            echo "${_v} explicit"; unset _h _pt _role_default _r _k _v; return 0
+        fi
+        if [ "${_k}" = "${_h}" ]; then
+            echo "${_v} explicit"; unset _h _pt _role_default _r _k _v; return 0
+        fi
+    done
+
+    # 段1: 変数名から用途が確定しているもの
+    if [ -n "${_role_default}" ]; then
+        echo "${_role_default} role"; unset _h _pt _role_default _r _k _v; return 0
+    fi
+
+    # 段2: ドメイン部分一致
+    if _n="$(otel_peer_by_domain "${_h}")"; then
+        echo "${_n} domain"; unset _h _pt _role_default _n; return 0
+    fi
+
+    # 段3: ポート番号
+    if [ -n "${_pt}" ] && _n="$(otel_peer_by_port "${_pt}")"; then
+        echo "${_n} port"; unset _h _pt _role_default _n; return 0
+    fi
+
+    # 段4: AWS 自動判定
+    if _n="$(otel_peer_by_aws "${_h}")"; then
+        echo "${_n} aws"; unset _h _pt _role_default _n; return 0
+    fi
+
+    unset _h _pt _role_default _n
+    return 1
+}
+
+# -----------------------------------------------------------------------------
+#  判定を回してマッピング文字列を組み立てる
+# -----------------------------------------------------------------------------
 _peer=""
-otel_peer_add "${DB_HOST:-}"           "aurora-mysql"
-otel_peer_add "${VALKEY_HOST:-}"       "elasticache-valkey"
-otel_peer_add "${REPORT_ALB_HOST:-}"   "report-ec2"
-otel_peer_add "${EXTERNAL_SLB_HOST:-}" "external-slb"
-otel_peer_add "${SQS_HOST:-}"          "sqs"
+_peer_report=""
 
-# back へのマッピングは front のときだけ入れる。
-#
-# ★ 注意: peer-service-mapping はホスト名だけで照合し、ポートは見ない。
-#   ECS のタスク内では front も back も ADOT サイドカーも同じ localhost なので、
-#   back 自身にこのマッピングを入れると「自分自身を <service>-back と呼ぶ」
-#   無意味なマッピングになる。front は実際に localhost:18080 (back) しか
-#   呼ばないため、front に限れば正しく効く。
-#   将来 localhost の別ポートを呼ぶ相手が増えたら、この方式では区別できない。
-#   その場合は接続先を FQDN にするか、アプリ側で peer.service を明示する。
-if [ "${APP_ROLE}" = "front" ]; then
-    otel_peer_add "${BACKEND_HOST:-}" "${APP_SERVICE}-back"
-fi
+otel_peer_emit() {
+    # $1 = host / $2 = port (空可) / $3 = name
+    [ -n "${1:-}" ] && [ -n "${3:-}" ] || return 0
+    # localhost / 127.0.0.1 はポート付きでしか出さない。
+    #   ECS のタスク内では front も back も ADOT サイドカーも同じ localhost。
+    #   ホスト名だけのエントリを出すと「自分自身」や Collector まで
+    #   同じ論理名で塗ってしまう。
+    case "$1" in
+        localhost|127.0.0.1|::1|"[::1]")
+            [ -n "${2:-}" ] || return 0
+            _peer="${_peer}${_peer:+,}$1:$2=$3"
+            return 0 ;;
+    esac
+    _peer="${_peer}${_peer:+,}$1=$3"
+    # ポートが分かっているときは host:port 版も出す (より具体的な方が優先される)
+    [ -n "${2:-}" ] && _peer="${_peer},$1:$2=$3"
+    return 0
+}
 
-# 連携先が増えたときに外から足すためのフック
+# 判定対象の表。 <ホスト変数>|<ポート変数>|<URL 変数>|<段1 の役割既定名>|<説明>
+#   役割既定名を空にすると段2 以降 (ドメイン/ポート/AWS) だけで判定する。
+#   ★ 外部 SLB (EXTERNAL_SLB_HOST) は APP_PEER_ALB_MODE の影響を受けない。
+#     こちらは AWS の ALB ではなく相手側のロードバランサーで、その裏に
+#     何が居るかは分からない。透過扱いにしようがないので常に
+#     external-slb というノードで止まる。
+_alb_role_name="report-ec2"
+[ "${APP_PEER_ALB_MODE}" = "alb" ] && _alb_role_name="report-alb"
+
+otel_peer_targets() {
+    cat <<TARGETS
+DB_HOST|DB_PORT||aurora-mysql|Aurora Serverless v2 (MySQL)
+VALKEY_HOST|VALKEY_PORT||elasticache-valkey|ElastiCache for Valkey
+REPORT_ALB_HOST|REPORT_ALB_PORT|REPORT_ALB_URL|${_alb_role_name}|帳票 EC2 (ALB 経由)
+EXTERNAL_SLB_HOST|EXTERNAL_SLB_PORT|EXTERNAL_SLB_URL|external-slb|外部 SLB (VPC 外)
+SQS_HOST|SQS_PORT|SQS_ENDPOINT|sqs|Amazon SQS
+TARGETS
+    # back へのマッピングは front のときだけ。back 自身は back を呼ばない。
+    if [ "${APP_ROLE}" = "front" ]; then
+        echo "BACKEND_HOST|BACKEND_PORT|BACKEND_URL|${APP_SERVICE}-back|同一タスク内の back"
+    fi
+}
+
+_old_ifs="${IFS}"
+IFS='
+'
+for _t in $(otel_peer_targets); do
+    IFS='|' read -r _hv _pv _uv _rd _desc <<TARGETLINE
+${_t}
+TARGETLINE
+    IFS="${_old_ifs}"
+
+    eval "_h=\${${_hv}:-}"
+    eval "_pt=\${${_pv}:-}"
+    if [ -n "${_uv}" ]; then
+        eval "_url=\${${_uv}:-}"
+    else
+        _url=""
+    fi
+    # ホストが直接与えられていなければ URL から拾う。
+    # 起動ログにはどちらの変数から採ったかを出す (切り分けのため)。
+    _src_var="${_hv}"
+    if [ -z "${_h}" ] && [ -n "${_url}" ]; then
+        _h="$(otel_url_host "${_url}")"
+        _src_var="${_uv}"
+    fi
+    [ -n "${_pt}" ] || { [ -n "${_url}" ] && _pt="$(otel_url_port "${_url}")"; }
+
+    if [ -n "${_h}" ]; then
+        if _res="$(otel_peer_resolve "${_h}" "${_pt}" "${_rd}")"; then
+            _name="${_res%% *}"; _stage="${_res##* }"
+            otel_peer_emit "${_h}" "${_pt}" "${_name}"
+            _peer_report="${_peer_report}${_peer_report:+;}${_src_var}=${_h}${_pt:+:${_pt}} -> ${_name} (段: ${_stage})"
+        else
+            _peer_report="${_peer_report}${_peer_report:+;}${_src_var}=${_h} -> (判定できず: FQDN のまま出ます)"
+        fi
+    fi
+    IFS='
+'
+done
+IFS="${_old_ifs}"
+
+# --- 用途が未知の連携先 (段2 以降だけで判定させる) ----------------------------
+#   書式: host または host:port のカンマ区切り。
+#     APP_PEER_EXTRA_HOSTS="orders.internal.example.com:8443,10.0.3.21:9000"
+#   「連携先が増えたが名前は AWS/ドメイン/ポートの規則で決めてよい」ときに使う。
+for _e in $(echo "${APP_PEER_EXTRA_HOSTS:-}" | tr ',' ' '); do
+    [ -n "${_e}" ] || continue
+    case "${_e}" in
+        \[*\]:*) _h="${_e%%\]:*}]"; _pt="${_e##*\]:}" ;;
+        *:*)     _h="${_e%%:*}";    _pt="${_e##*:}" ;;
+        *)       _h="${_e}";        _pt="" ;;
+    esac
+    if _res="$(otel_peer_resolve "${_h}" "${_pt}" "")"; then
+        _name="${_res%% *}"; _stage="${_res##* }"
+        otel_peer_emit "${_h}" "${_pt}" "${_name}"
+        _peer_report="${_peer_report}${_peer_report:+;}${_h}${_pt:+:${_pt}} -> ${_name} (段: ${_stage})"
+    else
+        _peer_report="${_peer_report}${_peer_report:+;}${_h} -> (判定できず)"
+    fi
+done
+
+# 生の対応表を最後に足すためのフック (書式は peer-service-mapping そのもの)
 if [ -n "${APP_EXTRA_PEER_SERVICE_MAPPING:-}" ]; then
-    if [ -n "${_peer}" ]; then _peer="${_peer},${APP_EXTRA_PEER_SERVICE_MAPPING}"
-    else _peer="${APP_EXTRA_PEER_SERVICE_MAPPING}"; fi
+    _peer="${_peer}${_peer:+,}${APP_EXTRA_PEER_SERVICE_MAPPING}"
 fi
+
 if [ -n "${_peer}" ]; then
     OTEL_INSTRUMENTATION_COMMON_PEER_SERVICE_MAPPING="${_peer}"
     export OTEL_INSTRUMENTATION_COMMON_PEER_SERVICE_MAPPING
 fi
+
+unset _t _hv _pv _uv _rd _desc _h _pt _url _res _name _stage _e _old_ifs \
+      _src_var _alb_role_name
 
 # -----------------------------------------------------------------------------
 # 7. 計装ごとの調整
@@ -333,14 +610,206 @@ fi
 : "${OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED:=true}"
 export OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED
 
-# --- 呼び出し元の識別 ---
-#  EC2 バッチ / Lambda / 利用者ブラウザのどれが入口かを X-Ray で絞り込めるよう、
-#  独自ヘッダをスパン属性として取り込む。Collector 側で annotation app_caller へ
-#  昇格させるので、X-Ray のフィルタ式で
-#      annotation.app_caller = "batch-ec2"
-#  のように検索できるようになる。
-: "${OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS:=x-app-caller}"
-export OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS
+# =============================================================================
+#  --- HTTP リクエスト/レスポンスの中身をスパンに載せる ---
+#
+#  ★ 自動計装だけでどこまで見えるのか (結論)
+#
+#    見える  | ヘッダ (リクエスト/レスポンス、サーバ/クライアント両方)
+#            |   -> capture-request-headers / capture-response-headers
+#            |      許可リストに書いた名前だけが属性になる
+#    見える  | クエリ文字列そのもの (url.query / url.full)
+#            |   -> 既定で付く。設定不要。ただし伏せ字にはならない (後述)
+#    見える  | リクエストパラメータを名前ごとに個別の属性へ
+#            |   -> servlet の capture-request-parameters
+#            |      GET のクエリと POST の application/x-www-form-urlencoded を
+#            |      両方拾う (ServletRequest#getParameterValues と同じ範囲)
+#    見えない| リクエストボディ / レスポンスボディそのもの
+#            |   -> JSON や XML のボディを属性に載せる機能は
+#            |      OpenTelemetry / ADOT の自動計装には無い。
+#            |      ボディはストリームであり、エージェントが読むと
+#            |      アプリが読めなくなる (一度しか読めない) ため、
+#            |      仕様として意図的に実装されていない。
+#            |      どうしても要る場合の現実的な代替は docs/request-attributes.md。
+#
+#  ★ 属性名 (Collector / X-Ray / Jaeger で探すときのキー)
+#      http.request.header.<小文字ヘッダ名>     文字列配列
+#      http.response.header.<小文字ヘッダ名>    文字列配列
+#      servlet.request.parameter.<小文字名>     文字列配列
+#      url.path / url.query / url.full          文字列
+#
+#    ★ 配列であることが X-Ray では重要。X-Ray の annotation は
+#      スカラー値しか受け付けないため、配列のままでは検索できる
+#      annotation にならない (metadata には入る)。Collector 側の
+#      transform で先頭要素へ潰してから annotation に昇格させている。
+#
+#  ★ 個人情報の扱い
+#    ヘッダもパラメータも「許可リストに書いたものだけ」が載る方式なので、
+#    既定では何も漏れない。逆に言えば、ここに何を書くかがそのまま
+#    「X-Ray / Jaeger に何を保存するか」の判断になる。
+#    認証情報を含むヘッダは下の拒否リストで機械的に弾く。
+# =============================================================================
+
+# --- 拒否リスト: 何があっても取り込まないヘッダ ------------------------------
+#   許可リストに紛れ込んでも、ここで落としてから JVM へ渡す。
+#   「うっかり Cookie を入れてしまい X-Ray に平文で保存され続ける」
+#   という事故は取り返しがつかない (保存済みトレースは消せない)。
+: "${APP_CAPTURE_HEADERS_DENY:=authorization,proxy-authorization,cookie,set-cookie,x-api-key,x-amz-security-token,x-amz-credential,x-csrf-token,x-xsrf-token}"
+
+# 許可リストから拒否リストのヘッダを取り除く。除去したら理由を必ず出す。
+otel_filter_headers() {
+    # $1 = ラベル (ログ用) / $2 = カンマ区切りの許可リスト
+    _fh_out=""
+    for _fh in $(echo "$2" | tr ',' ' '); do
+        [ -n "${_fh}" ] || continue
+        # 大文字小文字は区別しない (エージェント側も小文字で正規化する)
+        _fh_lc="$(echo "${_fh}" | tr 'A-Z' 'a-z')"
+        _fh_denied=0
+        for _fd in $(echo "${APP_CAPTURE_HEADERS_DENY}" | tr ',' ' '); do
+            [ -n "${_fd}" ] || continue
+            if [ "${_fh_lc}" = "$(echo "${_fd}" | tr 'A-Z' 'a-z')" ]; then _fh_denied=1; break; fi
+        done
+        if [ "${_fh_denied}" = "1" ]; then
+            otel_warn "$1 のヘッダ [${_fh_lc}] は拒否リスト (APP_CAPTURE_HEADERS_DENY) にあるため取り込みません。認証情報がトレースに保存されるのを防ぐためです。どうしても必要なら APP_CAPTURE_HEADERS_DENY から外してください (推奨しません)。"
+            continue
+        fi
+        _fh_out="${_fh_out}${_fh_out:+,}${_fh_lc}"
+    done
+    echo "${_fh_out}"
+    unset _fh _fh_lc _fh_denied _fd _fh_out
+}
+
+# --- サーバ側 (自分が受けたリクエスト) ---------------------------------------
+#  ★ ALB を挟むと「誰が叩いたのか」がアプリからは見えなくなる。
+#    ALB が付けてくれるヘッダをそのまま属性にすれば、コードを触らずに
+#    呼び出し元・実クライアント IP・入口のプロトコルまで X-Ray から追える。
+#
+#      x-app-caller        自前の呼び出し元識別 (batch-ec2 / lambda-sqs / user)
+#      x-amzn-trace-id     ALB が採番したトレース ID。ログとの突き合わせに使う
+#      x-forwarded-for     ALB の手前の実クライアント IP
+#      x-forwarded-proto   利用者側が HTTPS だったか (ALB で TLS 終端するため)
+#      x-forwarded-port    同上
+#      host                Host ヘッダ。同じ ALB に複数ドメインを載せている場合の切り分け
+#      user-agent          ブラウザかバッチかの裏取り
+#      referer             画面遷移の追跡
+#      content-type        ボディの形式 (ボディ自体は載らないが形式は分かる)
+#      x-request-id        呼び出し元が採番した ID があれば
+: "${APP_CAPTURE_REQUEST_HEADERS:=x-app-caller,x-amzn-trace-id,x-forwarded-for,x-forwarded-proto,x-forwarded-port,host,user-agent,referer,content-type,x-request-id}"
+if [ -n "${APP_CAPTURE_REQUEST_HEADERS_EXTRA:-}" ]; then
+    APP_CAPTURE_REQUEST_HEADERS="${APP_CAPTURE_REQUEST_HEADERS},${APP_CAPTURE_REQUEST_HEADERS_EXTRA}"
+fi
+
+#  レスポンス側。ALB の裏のどのサーバが応答したかを持ち帰れる場合がある。
+#      content-type / content-length  応答の形
+#      x-server-id / x-backend-server 相手が付けてくれるなら「実サーバ」が分かる
+#                                     (ALB は付けない。ターゲット側の実装次第)
+: "${APP_CAPTURE_RESPONSE_HEADERS:=content-type,content-length,x-server-id,x-backend-server}"
+if [ -n "${APP_CAPTURE_RESPONSE_HEADERS_EXTRA:-}" ]; then
+    APP_CAPTURE_RESPONSE_HEADERS="${APP_CAPTURE_RESPONSE_HEADERS},${APP_CAPTURE_RESPONSE_HEADERS_EXTRA}"
+fi
+
+# --- クライアント側 (自分が投げたリクエスト) ---------------------------------
+#  ★ ALB 越しの呼び出しで最も効く設定。
+#    「自分が送った X-Amzn-Trace-Id」と「ALB が返してきた X-Amzn-Trace-Id」を
+#    両方スパンに残すと、ALB でトレース ID が張り替えられていないかを
+#    X-Ray / Jaeger 上だけで判定できる (docs/alb-tracing.md)。
+: "${APP_CAPTURE_CLIENT_REQUEST_HEADERS:=x-app-caller,x-amzn-trace-id,traceparent,host}"
+: "${APP_CAPTURE_CLIENT_RESPONSE_HEADERS:=x-amzn-trace-id,x-server-id,x-backend-server,server,content-type}"
+if [ -n "${APP_CAPTURE_CLIENT_REQUEST_HEADERS_EXTRA:-}" ]; then
+    APP_CAPTURE_CLIENT_REQUEST_HEADERS="${APP_CAPTURE_CLIENT_REQUEST_HEADERS},${APP_CAPTURE_CLIENT_REQUEST_HEADERS_EXTRA}"
+fi
+if [ -n "${APP_CAPTURE_CLIENT_RESPONSE_HEADERS_EXTRA:-}" ]; then
+    APP_CAPTURE_CLIENT_RESPONSE_HEADERS="${APP_CAPTURE_CLIENT_RESPONSE_HEADERS},${APP_CAPTURE_CLIENT_RESPONSE_HEADERS_EXTRA}"
+fi
+
+# 外から OTEL_* を直接渡された場合はそちらを尊重する (脱出口)。
+: "${OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS:=$(otel_filter_headers 'HTTP server request' "${APP_CAPTURE_REQUEST_HEADERS}")}"
+: "${OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_RESPONSE_HEADERS:=$(otel_filter_headers 'HTTP server response' "${APP_CAPTURE_RESPONSE_HEADERS}")}"
+: "${OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_REQUEST_HEADERS:=$(otel_filter_headers 'HTTP client request' "${APP_CAPTURE_CLIENT_REQUEST_HEADERS}")}"
+: "${OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_RESPONSE_HEADERS:=$(otel_filter_headers 'HTTP client response' "${APP_CAPTURE_CLIENT_RESPONSE_HEADERS}")}"
+export OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS \
+       OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_RESPONSE_HEADERS \
+       OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_REQUEST_HEADERS \
+       OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_RESPONSE_HEADERS
+
+# --- リクエストパラメータ (クエリ + フォーム) --------------------------------
+#
+#  ★ 自動計装だけでリクエストパラメータを個別の属性にできる、唯一の口。
+#
+#    servlet 計装の capture-request-parameters に「名前」を並べると、
+#    その名前のパラメータだけが
+#        servlet.request.parameter.<小文字名>  (文字列配列)
+#    としてサーバスパンに載る。中身は ServletRequest#getParameterValues と
+#    同じなので、
+#        - GET のクエリ文字列        ?orderId=A-1&mode=full
+#        - POST の application/x-www-form-urlencoded ボディ
+#    の両方が対象になる。JSON ボディ (application/json) は
+#    サーブレットのパラメータではないので **取れない**。
+#
+#  ★ 既定は空 = 何も取り込まない。
+#    業務パラメータは個人情報そのものであることが多く、X-Ray に保存された
+#    トレースは後から消せない。「何を残してよいか」を決めた上で
+#    名前を明示的に並べる運用にする。
+#
+#      APP_CAPTURE_REQUEST_PARAMETERS=orderid,mode,page
+#
+#  ★ POST のフォームを対象にするときの注意 (これは実装に効く)
+#    エージェントはスパンを閉じる直前に getParameterValues を呼ぶ。
+#    サーブレット仕様上、これはフォームボディをパースして消費する。
+#    アプリが getInputStream() / getReader() で生ボディを読む作りだと、
+#    先に消費されて読めなくなる可能性がある。
+#    JAX-RS の @FormParam / @BeanParam のようにサーブレットの
+#    パラメータ経由で読む作りなら問題ない。
+#    生ボディを読むエンドポイントがあるなら、GET のクエリだけに絞るか
+#    この機能自体を使わないこと。
+#
+#  ★ 設定キーの版差
+#    ADOT 2.11 系 (本構成が固定している版) が解釈するのは
+#      otel.instrumentation.servlet.experimental.capture-request-parameters
+#    OpenTelemetry Java 2.2x 以降ではこれが
+#      otel.instrumentation.servlet.experimental.request-parameters.included
+#      otel.instrumentation.servlet.experimental.request-parameters.excluded
+#    (ワイルドカード対応) に置き換わり、旧キーは非推奨エイリアスになった。
+#    エージェントを上げたときに「設定したのに出ない / 非推奨 WARN が出る」で
+#    詰まらないよう、どちらのキーを出すかを選べるようにしておく。
+#      APP_CAPTURE_REQUEST_PARAMETERS_KEY=legacy (既定) | included
+: "${APP_CAPTURE_REQUEST_PARAMETERS:=}"
+: "${APP_CAPTURE_REQUEST_PARAMETERS_KEY:=legacy}"
+if [ -n "${APP_CAPTURE_REQUEST_PARAMETERS}" ]; then
+    case "${APP_CAPTURE_REQUEST_PARAMETERS_KEY}" in
+        legacy)
+            : "${OTEL_INSTRUMENTATION_SERVLET_EXPERIMENTAL_CAPTURE_REQUEST_PARAMETERS:=${APP_CAPTURE_REQUEST_PARAMETERS}}"
+            export OTEL_INSTRUMENTATION_SERVLET_EXPERIMENTAL_CAPTURE_REQUEST_PARAMETERS
+            ;;
+        included)
+            : "${OTEL_INSTRUMENTATION_SERVLET_EXPERIMENTAL_REQUEST_PARAMETERS_INCLUDED:=${APP_CAPTURE_REQUEST_PARAMETERS}}"
+            export OTEL_INSTRUMENTATION_SERVLET_EXPERIMENTAL_REQUEST_PARAMETERS_INCLUDED
+            if [ -n "${APP_CAPTURE_REQUEST_PARAMETERS_EXCLUDED:-}" ]; then
+                : "${OTEL_INSTRUMENTATION_SERVLET_EXPERIMENTAL_REQUEST_PARAMETERS_EXCLUDED:=${APP_CAPTURE_REQUEST_PARAMETERS_EXCLUDED}}"
+                export OTEL_INSTRUMENTATION_SERVLET_EXPERIMENTAL_REQUEST_PARAMETERS_EXCLUDED
+            fi
+            ;;
+        *)
+            otel_die "APP_CAPTURE_REQUEST_PARAMETERS_KEY の値が不正です: [${APP_CAPTURE_REQUEST_PARAMETERS_KEY}] / legacy または included を指定してください。" 46
+            ;;
+    esac
+    otel_warn "リクエストパラメータをスパン属性に取り込みます: [${APP_CAPTURE_REQUEST_PARAMETERS}] / 個人情報を含む名前が混ざっていないか確認してください (保存済みトレースは後から消せません)。POST フォームを含む場合はアプリが生ボディを読んでいないことも確認してください。"
+fi
+
+# --- クエリ文字列の伏せ字 -----------------------------------------------------
+#  url.query / url.full は既定で丸ごと属性に入る。トークンを URL に載せる
+#  相手 (署名付き URL など) を呼ぶと、そのままトレースに保存される。
+#
+#  ★ エージェント側の伏せ字機能は OpenTelemetry Java 2.14.0 以降のもので、
+#    本構成が固定している ADOT 2.11 系にはまだ入っていない。
+#    したがって **Collector 側の transform/redact-sensitive が本命**
+#    (otel/collector-*.yaml。両環境で同一)。ここでは、エージェントを
+#    上げたときに二重で効くよう設定だけ先に置いておく。
+#    キーが未知の版でも「知らないプロパティ」として無視されるだけで、
+#    起動が壊れることはない。
+: "${APP_SENSITIVE_QUERY_PARAMETERS:=AWSAccessKeyId,Signature,X-Amz-Signature,X-Amz-Credential,X-Amz-Security-Token,sig,X-Goog-Signature,token,access_token,id_token,refresh_token,password,passwd,secret,apikey,api_key}"
+: "${OTEL_INSTRUMENTATION_SANITIZATION_URL_EXPERIMENTAL_SENSITIVE_QUERY_PARAMETERS:=${APP_SENSITIVE_QUERY_PARAMETERS}}"
+export OTEL_INSTRUMENTATION_SANITIZATION_URL_EXPERIMENTAL_SENSITIVE_QUERY_PARAMETERS
 
 # --- AWS Service Events (関数レベル計装) ---
 #
@@ -659,6 +1128,23 @@ otel_print_summary() {
     otel_log "  OTEL_PROPAGATORS                 = ${OTEL_PROPAGATORS}"
     otel_log "  OTEL_TRACES_SAMPLER              = ${OTEL_TRACES_SAMPLER} ${OTEL_TRACES_SAMPLER_ARG:-}"
     otel_log "  peer-service-mapping             = ${OTEL_INSTRUMENTATION_COMMON_PEER_SERVICE_MAPPING:-(なし)}"
+    # ★ 「なぜこのノード名になったのか」を段まで含めて残す。
+    #   X-Ray / Jaeger のマップが読めないときは、まずここを見る。
+    otel_log "  peer 判定 (ALB モード=${APP_PEER_ALB_MODE})"
+    if [ -n "${_peer_report}" ]; then
+        _old="${IFS}"; IFS=';'
+        for _line in ${_peer_report}; do
+            IFS="${_old}"; otel_log "      ${_line}"; IFS=';'
+        done
+        IFS="${_old}"; unset _old _line
+    else
+        otel_log "      (対象なし)"
+    fi
+    otel_log "  capture request headers (server) = ${OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS:-(なし)}"
+    otel_log "  capture response headers(server) = ${OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_RESPONSE_HEADERS:-(なし)}"
+    otel_log "  capture request headers (client) = ${OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_REQUEST_HEADERS:-(なし)}"
+    otel_log "  capture response headers(client) = ${OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_RESPONSE_HEADERS:-(なし)}"
+    otel_log "  capture request parameters       = ${APP_CAPTURE_REQUEST_PARAMETERS:-(なし。ボディは自動計装では取得不可)}"
     otel_log "  service-events (function 計装)   = ${OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED} packages=${OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE:-(なし)}"
     otel_log "  db query sanitization            = ${OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED}"
     otel_log "  agent log suppress               = ${_agent_log_suppress_state} (-D ${_agent_log_suppress_count} 件)"

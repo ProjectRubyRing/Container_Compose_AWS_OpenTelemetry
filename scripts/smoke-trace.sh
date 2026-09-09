@@ -61,6 +61,28 @@ while [ "$i" -le "$ROUNDS" ]; do
     call "batch -> ALB -> front"        GET  "${ALB}/front/api/db"  batch-ec2
     call "batch -> ALB -> back"         GET  "${ALB}/back/api/db"    batch-ec2
 
+    echo "-- リクエストの中身がどこまでスパンに載るか --"
+    #  ★ token= を混ぜてあるのは、Collector の transform/redact-sensitive が
+    #    値を伏せるところまで確認するため。Jaeger の url.query タグが
+    #      orderId=A-1&mode=full&token=REDACTED
+    #    になっていれば効いている。生の token が見えたら設定が抜けている。
+    call "クエリ (url.query / パラメータ)" GET "${FRONT}/echo?orderId=A-1&mode=full&token=secret123" user
+    #  フォーム (application/x-www-form-urlencoded) はパラメータとして載る
+    printf '  %-34s ' "フォーム (パラメータとして載る)"
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+             -X POST -H "X-App-Caller: user" \
+             -H "Content-Type: application/x-www-form-urlencoded" \
+             --data 'orderId=B-2&mode=quick' "${FRONT}/echo" 2>/dev/null || echo "000")
+    printf '%s\n' "$([ "${code}" = "200" ] && echo OK || echo "NG HTTP ${code}")"
+    #  JSON ボディは ★載らない★ (自動計装に機能が無い)。その確認。
+    printf '  %-34s ' "JSON ボディ (載らないことの確認)"
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+             -X POST -H "X-App-Caller: user" \
+             -H "Content-Type: application/json" \
+             --data '{"orderId":"C-3","note":"body は属性にならない"}' \
+             "${FRONT}/echo" 2>/dev/null || echo "000")
+    printf '%s\n' "$([ "${code}" = "200" ] && echo OK || echo "NG HTTP ${code}")"
+
     echo "-- まとめて (1 トレースに全経路) --"
     call "front -> all"                 GET  "${FRONT}/all"      user
 
@@ -78,6 +100,37 @@ cat <<'MSG'
    Tags 検索例  = app_caller=batch-ec2
                   app_peer=aurora-mysql
                   app_role=back
+
+ 下流ノード名の多段階判定 (docs/peer-service-resolution.md):
+   app_peer=aurora-mysql      <- 下流ノード名 (= X-Ray サービスマップのノード)
+   app_peer_src=agent         <- アプリの peer-service-mapping で決まった
+   app_peer_src=domain        <- ホスト名の部分一致で決まった
+   app_peer_src=port          <- ポート番号で決まった
+   app_peer_src=aws           <- AWS SDK 計装の属性で決まった
+   app_peer_src=host          <- ★ どれも当たらず FQDN のまま = 名前の付け忘れ。
+                                 これで引けたスパンがあれば、その接続先を
+                                 APP_PEER_DOMAIN_RULES か Collector の
+                                 transform/peer-service-resolve に足す
+   ※ コンテナの起動ログ [otel-env] peer 判定 にも段ごとの内訳が出る:
+        docker compose logs front | grep "peer 判定" -A 8
+
+ ALB 経由の通信 (docs/alb-tracing.md):
+   app_via=alb                <- ALB (プロキシ) を通っている
+   app_upstream=report-ec2@…  <- ALB の裏で実際に応答したサーバ
+                                 (ターゲットが X-Server-Id を返した場合)
+   client_ip=…                <- ALB の手前の実クライアント IP
+   alb_trace_id=Root=1-…      <- ALB アクセスログとの結合キー
+   ※ ALB のノードはマップに出ない。ALB が X-Ray にセグメントを
+     送らないため。ALB での待ち時間を EC2 の処理時間と分けたいときは
+     alb_trace_id で ALB アクセスログと突き合わせる
+
+ リクエストの中身 (docs/request-attributes.md):
+   url.query                          <- クエリ文字列。token= は REDACTED になる
+   http.request.header.x-forwarded-for<- 取り込んだヘッダ (文字列配列)
+   servlet.request.parameter.orderid  <- APP_CAPTURE_REQUEST_PARAMETERS を
+                                         設定したときだけ出る
+   ※ JSON ボディは **どの設定でも出ない**。/api/echo に JSON を POST した
+     トレースにボディが無いことが、その確認になる
 
  X-Ray の indexed_attributes をローカルで検証する (1 つずつ Tags に入れる):
    app_ns=shopdemo            <- service.namespace   (APP_NAMESPACE)

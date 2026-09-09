@@ -21,6 +21,9 @@
 | 伝播ヘッダ | `traceparent` が主役 | `X-Amzn-Trace-Id` が主役 | 両方有効にして吸収 |
 | annotation キー | 制約なし | `[A-Za-z0-9_]` のみ | transform で吸収 |
 | Collector 設定の配布 | ファイルマウント | Secrets Manager → `AOT_CONFIG_CONTENT` | タスク定義 |
+| 下流ノード名 | `peer.service` はただのタグ | `peer.service` が**ノード名になる** | 同じ値を入れて吸収 |
+| ヘッダ属性 (配列) | 配列のまま検索できる | annotation にならない | transform で `[0]` に潰す |
+| URL のトークン | 出ても被害は小さい | **消せない形で保存される** | `transform/redact-sensitive` |
 
 `otel/collector-xray.yaml` と `otel/collector-compose.yaml` の差分箇所には
 すべて `★XRAY-DIFF` コメントが付けてある。それ以外は 1 文字も違わない。
@@ -164,6 +167,22 @@ indexed_attributes:
 | `aws.ecs.service.name` | `otel-env.sh` (`APP_SERVICE`) | `ecs_service` | `ecs_service=intra-api` |
 | `aws.ecs.task.family` | 本番: ecs ディテクタ / ローカル: compose.yaml | `ecs_task_family` | `ecs_task_family=intra-api-local` |
 
+スパン属性から作るものも同じ扱いになる (リソース属性ではないので
+transform で写す必要は無く、`indexed_attributes` に名前を並べるだけ)。
+
+| 元 | 出どころ | annotation 名 | Jaeger のタグ検索 |
+|---|---|---|---|
+| `peer.service` | 多段階判定 | `app_peer` | `app_peer=aurora-mysql` |
+| 判定の段 | `transform/peer-service-resolve` | `app_peer_src` | `app_peer_src=host` |
+| `X-Forwarded-For` の先頭 | ヘッダ取り込み | `client_ip` | `client_ip=203.0.113.10` |
+| `X-Forwarded-Proto` | ヘッダ取り込み | `client_proto` | `client_proto=https` |
+| `Host` | ヘッダ取り込み | `http_host` | `http_host=api.example.com` |
+| `X-Request-Id` | ヘッダ取り込み | `request_id` | `request_id=...` |
+| `X-Amzn-Trace-Id` | ヘッダ取り込み | `alb_trace_id` | `alb_trace_id=Root=1-...` |
+| レスポンスの `X-Server-Id` | ヘッダ取り込み | `app_upstream` | `app_upstream=report-ec2@...` |
+| ALB 経由かどうか | `transform/peer-service-resolve` | `app_via` | `app_via=alb` |
+| `servlet.request.parameter.orderid` | パラメータ取り込み | `app_param` | `app_param=A-1` |
+
 X-Ray 側はこの右から 2 列目をそのまま使う。
 
 ```
@@ -235,10 +254,31 @@ X-Ray の annotation キーは `[A-Za-z0-9_]` のみ。
 置換後の名前が予想と違うと検索できないので、本構成では最初から
 `app_service` / `app_role` のようなフラットな名前を作っている。
 
+### ★ 配列の属性は annotation にならない
+
+ヘッダ由来の属性 (`http.request.header.<名前>`) と servlet の
+パラメータ (`servlet.request.parameter.<名前>`) は **文字列の配列**で入る
+(ヘッダもパラメータも同名で複数送れるため)。
+
+`awsxray` exporter が annotation にできるのは
+**文字列 / 数値 / 真偽値のスカラーだけ**。配列は `indexed_attributes` に
+名前を並べても annotation にならず、静かに metadata 行きになる。
+
+そのため `transform/xray-annotations` が `[0]` で先頭要素へ潰した
+スカラー版 (`app_caller` / `client_ip` / `app_upstream` / `app_param` …) を
+別名で作り、そちらを索引している。
+
+**Jaeger は配列のままでも検索できてしまう**ため、ここもローカルでは
+気づけない差分になる。フラットな名前で引けるかどうかだけを基準にすること。
+
+同じ理由で、Collector の条件式でヘッダ属性を `==` で文字列と比べても
+**一致しない**。`filter/drop-healthcheck` は `IsMatch()` を使っている。
+
 ### annotation の個数上限
 
 セグメントあたり **50 個**。`index_all_attributes: true` にすると
 SQL 文や URL まで索引され上限に当たりやすい。明示列挙を使うこと。
+本構成は 17 個を明示列挙している。
 
 ---
 
@@ -347,3 +387,18 @@ Collector が落ちたときにアプリまで巻き添えで停止すると、
 出すようにしてある (`base/cli/00-server-common.cli`)。
 「そもそもヘッダが来ていないのか、来ているのに送信できていないのか」を
 awslogs だけで切り分けられる。
+
+---
+
+## 10. 「ノード名が読めない」ときの切り分け順序
+
+| # | 確認 | 方法 |
+|---|---|---|
+| 1 | どの段で決まったか | `annotation.app_peer_src` (`host` なら判定に落ちている) |
+| 2 | 何を見て判定したか | `app_peer_host` / `app_peer_port` 属性 |
+| 3 | アプリ側の判定結果 | 起動ログの `[otel-env] peer 判定` |
+| 4 | Collector 2 本がずれていないか | `./scripts/check-collector-drift.sh` |
+| 5 | ローカルでは正しいのに X-Ray だけ違う | `peer.service` が上書きされていないか (Application Signals) |
+
+→ [`docs/peer-service-resolution.md`](peer-service-resolution.md) の
+「よくある詰まり方」に症状別の表がある。

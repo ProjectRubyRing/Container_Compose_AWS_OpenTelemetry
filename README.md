@@ -55,9 +55,12 @@ sim/                      ローカル専用スタブ (ALB / Lambda / 帳票EC2 
 ecs/                      タスク定義テンプレート
 scripts/                  build / up / down / smoke-trace / gen-taskdefs / drift check
 docs/
-  naming-convention.md    ★ 命名規約と X-Ray での検索方法
-  xray-vs-jaeger.md       ★ Compose と X-Ray の差分・注意点
-  trace-paths.md          ★ 6 経路それぞれの伝播の仕組み
+  naming-convention.md       ★ 命名規約と X-Ray での検索方法
+  xray-vs-jaeger.md          ★ Compose と X-Ray の差分・注意点
+  trace-paths.md             ★ 7 経路それぞれの伝播の仕組み
+  peer-service-resolution.md ★ 下流ノード名の多段階判定 (ドメイン/ポート/AWS)
+  request-attributes.md      ★ ヘッダ・クエリ・パラメータ・ボディの載せ方と限界
+  alb-tracing.md             ★ ALB を挟んだ EC2 通信の見え方と、その先まで繋ぐ方法
 ```
 
 ---
@@ -86,18 +89,89 @@ service.name = ${APP_SERVICE}-${APP_ROLE}
 
 → 詳細: [`docs/naming-convention.md`](docs/naming-convention.md)
 
-### 2. 計装していない相手のノード名も環境変数だけで決まる
+### 2. 計装していない相手のノード名は多段階判定で決まる
 
-Aurora / Valkey / 帳票 EC2 / 外部 SLB は計装できない。既定ではマップに
-`aurora-xxx.cluster-abc.ap-northeast-1.rds.amazonaws.com` のような FQDN が並ぶ。
+Aurora / Valkey / ALB / 帳票 EC2 / 外部 SLB は計装できない。既定ではマップに
+`aurora-xxx.cluster-abc.ap-northeast-1.rds.amazonaws.com` のような FQDN が並び、
+長くて読めないうえ環境ごとに文字列が違うので同じ相手が別ノードに割れる。
 
-`otel-env.sh` が接続先ホストの環境変数から
-`OTEL_INSTRUMENTATION_COMMON_PEER_SERVICE_MAPPING` を組み立てるので、
-**アプリのコードを 1 行も触らずに** `aurora-mysql` / `elasticache-valkey` /
-`report-ec2` / `external-slb` という運用上の呼び名に揃う。
+`peer.service` を付ければノード名を完全に制御できる (X-Ray の
+`awsxray` exporter がノード名を決める際、FQDN より優先して見る)。
+その `peer.service` を **5 段の判定**で決める。上の段で決まったら打ち切る。
 
-アプリが接続に使うホスト名とマッピングのキーが同じ環境変数から来るため、
-両者がずれることが構造的に起きない。
+| 段 | 何を見るか | 決めるのは |
+|---|---|---|
+| 0 `explicit` | `APP_PEER_SERVICE_MAPPING` に運用が書いた対応 | アプリ |
+| 1 `role` | `DB_HOST` などの**変数名** (用途が確定している) | アプリ |
+| 2 `domain` | ホスト名の**部分一致** (`.rds.amazonaws.com` など) | アプリ + Collector |
+| 3 `port` | **ポート番号** (`3306` / `6379` / `18080` など) | アプリ + Collector |
+| 4 `aws` | AWS の命名規則 / AWS SDK 計装の属性 | アプリ + Collector |
+
+段2 の部分一致は FQDN 全体を書かないので、dev/stg/prd でエンドポイントが
+変わっても追随不要。段3 は **ECS のタスク内で唯一の区別手段**になる
+(awsvpc では front も back も ADOT サイドカーも同じ `localhost` なので、
+`localhost:18080` のようにポートまで含めないと区別できない)。
+
+段2 以降は Collector 側 (`transform/peer-service-resolve`) にも同じ規則が
+あり、アプリが決められなかったスパン (運用中に足された連携先、AWS SDK が
+内部で叩く別サービス、IP 直指定) をそこで拾う。
+
+**どの段で決まったかを残すのがこの仕組みの肝。**
+
+```sh
+docker compose logs front | grep -A 8 "peer 判定"
+#   DB_HOST=aurora:3306 -> aurora-mysql (段: role)
+#   10.0.3.21:6379      -> elasticache-valkey (段: port)
+```
+
+```
+annotation.app_peer_src = "host"   # ★ 名前を付け損ねている相手の一覧
+```
+
+→ 詳細: [`docs/peer-service-resolution.md`](docs/peer-service-resolution.md)
+
+### 2-2. リクエストの中身をどこまで載せられるか
+
+| 対象 | 自動計装だけで | 属性名 |
+|---|---|---|
+| ヘッダ (サーバ / クライアント、req / res) | **出せる** | `http.request.header.<名前>` ほか |
+| クエリ文字列 | **既定で出る** | `url.query` / `url.full` |
+| リクエストパラメータ (GET のクエリ + POST のフォーム) | **出せる** | `servlet.request.parameter.<名前>` |
+| **ボディ (JSON / XML)** | **出せない** (機能が存在しない) | — |
+
+ヘッダは許可リスト方式で、認証情報を含むものは
+`APP_CAPTURE_HEADERS_DENY` がアプリ側で弾き、Collector 側でも捨てる。
+クエリ文字列は設定不要で載ってしまうので、逆に
+`transform/redact-sensitive` が `token=REDACTED` のように値を伏せる
+(エージェント側の伏せ字機能は OpenTelemetry Java 2.14.0 以降のもので、
+本構成が固定している ADOT 2.11 系には無い。**いま効いているのは
+Collector 側**)。
+
+→ 詳細と代替手段: [`docs/request-attributes.md`](docs/request-attributes.md)
+
+### 2-3. ALB を挟んだ EC2 通信
+
+**ALB は X-Ray にセグメントを送らない。** API Gateway と違い、ALB の
+ノードがマップに自動で生えることは無い。出るのはこちらのクライアント
+スパンが作る推定ノード 1 個だけで、ALB とターゲットの内訳は
+X-Ray だけでは分離できない。
+
+自動計装の範囲で取れるようにしてあるもの:
+
+| annotation | 何が分かるか |
+|---|---|
+| `app_via=alb` | ALB (プロキシ) を通っているか |
+| `app_upstream` | ALB の裏で実際に応答したサーバ (ターゲットが名乗った場合) |
+| `client_ip` | ALB の手前の実クライアント IP (`X-Forwarded-For` の先頭) |
+| `client_proto` | 利用者側が https だったか (ALB で TLS 終端するため中は http) |
+| `alb_trace_id` | ALB アクセスログ (`target_processing_time`) との結合キー |
+
+**ALB の先の EC2 まで繋ぐことは可能**で、EC2 側の JVM に同じ ADOT
+エージェントを入れるだけでよい (アプリ改修は不要)。その場合は
+EC2 の `OTEL_SERVICE_NAME` を `peer.service` と同じ文字列にすること。
+違うと同じ相手が 2 ノードに割れる。
+
+→ 詳細: [`docs/alb-tracing.md`](docs/alb-tracing.md)
 
 ### 3. X-Ray で「検索できる」形にする
 
@@ -115,8 +189,9 @@ annotation.app_peer    = "aurora-mysql"   # Aurora を呼んでいるスパン�
 Jaeger の Tags 欄でも `app_caller=batch-ec2` で同じ結果が得られる。
 
 `indexed_attributes` に並べるのは **transform 後のフラットなスパン属性名**
-(`app_ns` / `app_env` / `app_role` / `ecs_cluster` / `ecs_service` /
-`ecs_task_family`) であって、`service.namespace` や `aws.ecs.task.family` の
+(`app_ns` / `app_env` / `app_role` / `app_peer_src` / `app_via` /
+`app_upstream` / `client_ip` / `alb_trace_id` / `ecs_cluster` /
+`ecs_service` / `ecs_task_family` など) であって、`service.namespace` や `aws.ecs.task.family` の
 ようなリソース属性名ではない。書き間違えてもエラーにならず
 「annotation が付かないだけ」なので、`./scripts/smoke-trace.sh` の後に
 Jaeger の Tags で 1 つずつ引けることを確認する。

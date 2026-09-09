@@ -8,8 +8,11 @@ import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 
 import javax.sql.DataSource;
 import java.net.URI;
@@ -50,6 +53,8 @@ import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
  *   GET  /api/external  外部 SLB (VPC 外)         … HTTP クライアントスパン
  *   POST /api/sqs       SQS -> Lambda -> ALB -> back … PRODUCER スパン
  *   POST /api/from-lambda  Lambda からの受信      … サーバスパン (back のみ)
+ *   GET  /api/echo      クエリ / ヘッダの確認      … 自動計装で何が載るかの実験台
+ *   POST /api/echo      フォーム / JSON ボディの確認 … 同上
  *   GET  /api/all       上記をまとめて実行         … 1 トレースに全経路が入る
  * </pre>
  */
@@ -229,6 +234,72 @@ public class ApiResource {
         // 受信したヘッダをそのまま返す。
         out.put("x_amzn_trace_id", headers.getHeaderString("X-Amzn-Trace-Id"));
         out.put("traceparent", headers.getHeaderString("traceparent"));
+        out.put("x_app_caller", headers.getHeaderString("X-App-Caller"));
+        return Response.ok(json(out)).build();
+    }
+
+    // ------------------------------------------------------------------
+    //  8. リクエストの中身が自動計装でどこまでスパンに載るかの実験台
+    //
+    //  ★ ここも OpenTelemetry の API は 1 行も使っていない。
+    //    「アプリは普通に書く。何が載るかは設定で決まる」を確認するための
+    //    エンドポイントであって、計装のための細工ではない。
+    //
+    //  GET /api/echo?orderId=A-1&mode=full&token=secret123
+    //    スパンに載るもの:
+    //      url.path                            = /front/api/echo
+    //      url.query                           = orderId=A-1&mode=full&token=REDACTED
+    //                                            (伏せ字は Collector の
+    //                                             transform/redact-sensitive)
+    //      http.request.header.<許可した名前>   = 配列
+    //      servlet.request.parameter.orderid   = ["A-1"]
+    //                                            (APP_CAPTURE_REQUEST_PARAMETERS
+    //                                             に orderid を入れたときだけ)
+    //
+    //  POST /api/echo (application/x-www-form-urlencoded)
+    //    フォームのパラメータも servlet.request.parameter.<名前> に載る。
+    //    ServletRequest#getParameterValues がクエリとフォームの両方を返すため。
+    //
+    //  POST /api/echo (application/json)
+    //    ★ ボディは **一切載らない**。JSON はサーブレットのパラメータでは
+    //      ないので capture-request-parameters の対象外であり、
+    //      「ボディを属性にする」機能は自動計装に存在しない。
+    //      載るのは content-type / content-length といったヘッダまで。
+    //      レスポンスの captured 欄が空になることで、それをローカルで
+    //      目視確認できるようにしてある。詳細: docs/request-attributes.md
+    // ------------------------------------------------------------------
+    @GET
+    @Path("/echo")
+    public Response echoGet(@Context UriInfo uriInfo, @Context HttpHeaders headers) {
+        return echo(uriInfo.getQueryParameters(), headers, "query");
+    }
+
+    @POST
+    @Path("/echo")
+    @Consumes({MediaType.APPLICATION_FORM_URLENCODED, MediaType.APPLICATION_JSON,
+               MediaType.WILDCARD})
+    public Response echoPost(@Context UriInfo uriInfo, @Context HttpHeaders headers) {
+        // ★ ボディをここで読んでいない点が重要。
+        //   エージェントはスパンを閉じる直前に getParameterValues() を呼ぶ。
+        //   サーブレット仕様上、これはフォームボディをパースして消費するため、
+        //   アプリが getInputStream() で生ボディを読む作りだと競合しうる。
+        //   JAX-RS の @FormParam のようにパラメータ経由で読む作りなら安全。
+        //   (この注意点は docs/request-attributes.md にも書いてある)
+        return echo(uriInfo.getQueryParameters(), headers, "query+form");
+    }
+
+    private Response echo(MultivaluedMap<String, String> query, HttpHeaders headers,
+                          String source) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("service", Env.serviceName());
+        out.put("source", source);
+        out.put("query_keys", String.join(",", query.keySet()));
+        out.put("content_type", headers.getHeaderString("Content-Type"));
+        // ALB 経由かどうかをアプリ側からも見えるようにしておく。
+        // X-Ray / Jaeger の app_via / client_ip と同じ根拠で判断している。
+        out.put("via_alb", headers.getHeaderString("X-Forwarded-For") != null);
+        out.put("x_forwarded_for", headers.getHeaderString("X-Forwarded-For"));
+        out.put("x_amzn_trace_id", headers.getHeaderString("X-Amzn-Trace-Id"));
         out.put("x_app_caller", headers.getHeaderString("X-App-Caller"));
         return Response.ok(json(out)).build();
     }

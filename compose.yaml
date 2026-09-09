@@ -119,6 +119,53 @@ x-app-common: &app-common
     OTEL_TRACE_WARN_SUPPRESS: ${OTEL_TRACE_WARN_SUPPRESS:-resource,context}
     OTEL_AGENT_LOG_SUPPRESS_EXTRA: ${OTEL_AGENT_LOG_SUPPRESS_EXTRA:-}
 
+    # --- 下流ノード名の多段階判定 (peer.service) ------------------------------
+    #  X-Ray のサービスマップ / Jaeger の相手先ノードの名前を決める仕組み。
+    #  otel-env.sh が次の順で判定し、決まった段を起動ログに出す。
+    #
+    #    段0 明示     APP_PEER_SERVICE_MAPPING (host=名前 / host:port=名前)
+    #    段1 役割     DB_HOST などの変数名から用途が確定しているもの
+    #    段2 ドメイン APP_PEER_DOMAIN_RULES  (ホスト名の部分一致)
+    #    段3 ポート   APP_PEER_PORT_RULES    (ポート番号)
+    #    段4 AWS 自動 *.<service>.amazonaws.com からサービス名を機械的に抜く
+    #
+    #  段2 以降は Collector 側 (transform/peer-service-resolve) にも同じ規則が
+    #  あり、エージェントが決められなかったスパンをそこで拾う。
+    #
+    #  ★ ALB の見せ方
+    #    upstream (既定) ALB を透過扱いし、裏の実サービス名を使う
+    #                    -> マップは front -> report-ec2
+    #    alb             ALB 自体をノードにする
+    #                    -> マップは front -> report-alb で止まる
+    #    どちらでも ALB のノードが AWS 側から生えることは無い (ALB は X-Ray に
+    #    セグメントを送らない)。詳細は docs/alb-tracing.md。
+    APP_PEER_ALB_MODE: ${APP_PEER_ALB_MODE:-upstream}
+    APP_PEER_DOMAIN_RULES: ${APP_PEER_DOMAIN_RULES:-.rds.amazonaws.com=aurora-mysql,.cache.amazonaws.com=elasticache-valkey,.elb.amazonaws.com=alb,sqs.=sqs,.s3.=s3,s3.=s3,.execute-api.=api-gateway,.secretsmanager.=secretsmanager,.dkr.ecr.=ecr}
+    APP_PEER_PORT_RULES: ${APP_PEER_PORT_RULES:-3306=aurora-mysql,6379=elasticache-valkey,4317=adot-collector,4318=adot-collector,2000=adot-awsproxy}
+    #  用途が未知の連携先を段2 以降だけで名付けさせる (host または host:port)
+    APP_PEER_EXTRA_HOSTS: ${APP_PEER_EXTRA_HOSTS:-}
+    #  ホストを名指しで上書きする最優先の対応表
+    APP_PEER_SERVICE_MAPPING: ${APP_PEER_SERVICE_MAPPING:-}
+
+    # --- トレースに載せるリクエスト情報 ---------------------------------------
+    #  ★ 自動計装だけでどこまで載るか (詳細: docs/request-attributes.md)
+    #      ヘッダ            載る  許可リストに書いた名前だけ
+    #      クエリ文字列      載る  url.query は設定不要で既定で付く
+    #      リクエストパラメータ 載る servlet の capture-request-parameters。
+    #                              GET のクエリと POST のフォームが対象
+    #      ボディ (JSON 等)  載らない 自動計装には機能そのものが無い
+    #
+    #  認証情報を含むヘッダ (authorization / cookie / x-api-key など) は
+    #  APP_CAPTURE_HEADERS_DENY で機械的に弾く。許可リストに書いても入らない。
+    APP_CAPTURE_REQUEST_HEADERS_EXTRA: ${APP_CAPTURE_REQUEST_HEADERS_EXTRA:-}
+    APP_CAPTURE_RESPONSE_HEADERS_EXTRA: ${APP_CAPTURE_RESPONSE_HEADERS_EXTRA:-}
+    APP_CAPTURE_CLIENT_REQUEST_HEADERS_EXTRA: ${APP_CAPTURE_CLIENT_REQUEST_HEADERS_EXTRA:-}
+    APP_CAPTURE_CLIENT_RESPONSE_HEADERS_EXTRA: ${APP_CAPTURE_CLIENT_RESPONSE_HEADERS_EXTRA:-}
+    #  ★ 既定は空 = パラメータは 1 つも載せない。
+    #    載せるものは業務キーだけに絞ること。X-Ray に出たトレースは消せない。
+    #    ローカルで試すなら .env で APP_CAPTURE_REQUEST_PARAMETERS=orderid,mode
+    APP_CAPTURE_REQUEST_PARAMETERS: ${APP_CAPTURE_REQUEST_PARAMETERS:-}
+
     # --- ADOT Collector への送信先 (ECS では http://localhost:4317) ----------
     OTEL_EXPORTER_OTLP_ENDPOINT: http://adot-collector:4317
     OTEL_EXPORTER_OTLP_PROTOCOL: grpc
