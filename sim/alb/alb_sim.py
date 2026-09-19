@@ -35,6 +35,24 @@ Compose では再現できない。ここで X-Amzn-Trace-Id を実物と同じ�
   ※ 実 ALB は traceparent を「素通し」する。ここでも触らない。
      この素通しがあるため、front -> ALB -> back のように ALB を挟んでも
      自前の Java 同士は W3C で繋がったままになる。
+
+===============================================================================
+ 実 ALB がやらないこと (トレース上の限界。ここも忠実に再現する)
+===============================================================================
+  - **X-Ray にセグメントを送らない。**
+    API Gateway や AppSync と違い、ALB のノードが AWS 側から
+    サービスマップに生えてくることは無い。マップに出るのは
+    「呼び出し側のクライアントスパンが作った推定ノード」だけ。
+    したがって ALB とターゲットの内訳 (ALB で待たされたのか、EC2 が
+    遅いのか) は X-Ray だけでは分離できない。
+  - **どのターゲットへ振ったかをレスポンスで教えてくれない。**
+    X-Target-Group のようなヘッダは付かない。実サーバを知りたければ
+    ターゲット側が名乗るしかない (sim/report-ec2/stub.py の X-Server-Id)。
+
+  一方で **ターゲットが返したレスポンスヘッダは素通しする**。
+  ここもそれに合わせてあり、X-Server-Id はそのまま呼び出し側へ届く。
+  これが「ALB の裏の実サーバを自動計装だけで追う」唯一の足がかりになる。
+  詳細と実機での設定例は docs/alb-tracing.md。
 """
 
 import http.client
@@ -138,9 +156,10 @@ class Handler(BaseHTTPRequestHandler):
         if length:
             body = self.rfile.read(int(length))
 
-        self.log_message("%s %s -> %s  trace=%s (%s) caller=%s",
+        self.log_message("%s %s -> %s  trace=%s (%s) caller=%s xff=%s",
                          method, self.path, target, trace_id, origin,
-                         self.headers.get("X-App-Caller", "-"))
+                         self.headers.get("X-App-Caller", "-"),
+                         headers.get("X-Forwarded-For", "-"))
 
         try:
             host, _, port = target.partition(":")
@@ -153,10 +172,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(502, "upstream unreachable")
             return
 
+        # ターゲットが名乗った実サーバをログにも残す。
+        # 実 ALB は教えてくれないので、これが取れるかどうかは
+        # 「ターゲット側が X-Server-Id を返す実装になっているか」で決まる。
+        self.log_message("   <- %s server_id=%s", res.status,
+                         res.getheader("X-Server-Id", "-"))
+
         self.send_response(res.status)
         for k, v in res.getheaders():
             if k.lower() in HOP_BY_HOP or k.lower() == "content-length":
                 continue
+            # ★ ターゲットのレスポンスヘッダは素通しする (実 ALB と同じ)。
+            #   X-Server-Id がここを通って呼び出し側のスパンに載る。
             self.send_header(k, v)
         # 実 ALB もレスポンスに X-Amzn-Trace-Id を返す
         self.send_header(TRACE_HEADER, trace_id)

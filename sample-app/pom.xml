@@ -7,8 +7,14 @@
    front / back のどちらにも同じ WAR を配備し、振る舞いは APP_ROLE で変える。
 
    ★ 実プロジェクトでは front/back それぞれのビルド成果物を
-      --build-arg APP_SOURCE=<各チームの war> で差し替えればよい。
+      ビルド引数 APP_SOURCE (podman/docker build の build-arg) で
+      差し替えればよい。
       コンテナ側 (base/front/back) は WAR の中身に一切依存していない。
+
+      ※ XML のコメント内にハイフンを 2 つ続けて書くことはできない
+        (XML 1.0 の規定)。コマンドラインのロングオプションをそのまま
+        コメントに貼ると pom.xml 自体がパースできなくなり、
+        Maven が "Non-parseable POM" で止まる。
 
    ★ 依存関係と OpenTelemetry の関係
       アプリ側に OpenTelemetry の依存は 1 つも入れない。計装はすべて
