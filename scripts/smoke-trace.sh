@@ -40,14 +40,14 @@ while [ "$i" -le "$ROUNDS" ]; do
     echo "===== round ${i}/${ROUNDS} ====="
 
     echo "-- 経路 2/3: front -> Aurora / Valkey --"
-    call "front -> aurora-mysql"        GET  "${FRONT}/db"       user
-    call "front -> elasticache-valkey"  GET  "${FRONT}/cache"    user
+    call "front -> DataBase（Aurora_MySQL）" GET  "${FRONT}/db"       user
+    call "front -> session_store（Valkey）"  GET  "${FRONT}/cache"    user
 
     echo "-- 経路 1: front -> back (タスク内) --"
     call "front -> back -> aurora"      GET  "${FRONT}/back"     user
 
     echo "-- 経路 4: front -> ALB -> 帳票EC2 --"
-    call "front -> report-ec2"          GET  "${FRONT}/report"   user
+    call "front -> ec2_server"               GET  "${FRONT}/report"   user
 
     echo "-- 経路 7: front -> 外部SLB (VPC外) --"
     call "front -> external-slb"        GET  "${FRONT}/external" user
@@ -74,7 +74,7 @@ cat <<'MSG'
  Jaeger UI : http://localhost:16686
    Service      = intra-api-front / intra-api-back
    Tags 検索例  = app_caller=batch-ec2
-                  app_peer=aurora-mysql
+                  app_peer=DataBase（Aurora_MySQL）
                   app_role=back
 
  Collector が受信しているか:

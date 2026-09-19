@@ -57,9 +57,9 @@ ECS サービス名 + コンテナ名をハイフンで繋いだだけなので�
 
 | 相手 | ホストを与える環境変数 | マップ上のノード名 |
 |---|---|---|
-| Aurora Serverless v2 (MySQL 8.4) | `DB_HOST` | `aurora-mysql` |
-| ElastiCache for Valkey | `VALKEY_HOST` | `elasticache-valkey` |
-| 帳票 EC2 (ALB 経由) | `REPORT_ALB_HOST` | `report-ec2` |
+| Aurora Serverless v2 (MySQL 8.4) | `DB_HOST` | `DataBase（Aurora_MySQL）` |
+| ElastiCache for Valkey | `VALKEY_HOST` | `session_store（Valkey）` |
+| 帳票 EC2 (ALB 経由) | `REPORT_ALB_HOST` | `ec2_server` |
 | 外部 SLB (VPC 外) | `EXTERNAL_SLB_HOST` | `external-slb` |
 | SQS | `SQS_HOST` | `sqs` |
 | back (front から見て) | `BACKEND_HOST` | `${APP_SERVICE}-back` |
@@ -71,6 +71,10 @@ ECS サービス名 + コンテナ名をハイフンで繋いだだけなので�
 **アプリが接続に使うホスト名と、マッピングのキーが同じ環境変数から来る**ので、
 両者がずれることが構造的に起きない。逆に、アプリ側でホスト名をハードコードすると
 マッピングが外れて FQDN 表示に戻るので注意。
+
+表示名そのもの (この表の右列) は `otel-env.sh` の `PEER_NAME_*` に集約してあり、
+環境変数だけで変えられる。**丸括弧は X-Ray のセグメント名に使えない文字**である点を
+含め、付け方と変更手順は [`docs/xray-node-naming.md`](xray-node-naming.md) にまとめてある。
 
 ---
 
@@ -87,7 +91,7 @@ ECS サービス名 + コンテナ名をハイフンで繋いだだけなので�
 | `app_role` | `back` | `APP_ROLE` |
 | `app_env` | `prd` | `APP_ENV` |
 | `app_ns` | `shopdemo` | `APP_NAMESPACE` |
-| `app_peer` | `aurora-mysql` | `peer.service` |
+| `app_peer` | `DataBase（Aurora_MySQL）` | `peer.service` |
 | `app_caller` | `batch-ec2` / `lambda-sqs` / `user` / `healthcheck` | `X-App-Caller` ヘッダ |
 | `ecs_service` | `intra-api` | `aws.ecs.service.name` |
 | `ecs_task_family` | `intra-api-prd` | ECS リソース検出 |
@@ -105,7 +109,7 @@ annotation.app_caller = "batch-ec2"
 annotation.app_caller = "lambda-sqs" AND duration > 3
 
 # Aurora を呼んでいて失敗したスパン
-annotation.app_peer = "aurora-mysql" AND fault
+annotation.app_peer = "DataBase（Aurora_MySQL）" AND fault
 
 # 本番の intra-web 全体
 annotation.app_env = "prd" AND annotation.app_service = "intra-web"
@@ -130,7 +134,7 @@ X-Ray の annotation キーには **`[A-Za-z0-9_]` しか使えない**。
 |---|---|---|
 | サービス名 | サービスマップのノード | 左上の Service ドロップダウン |
 | バッチ由来を検索 | `annotation.app_caller = "batch-ec2"` | Tags 欄に `app_caller=batch-ec2` |
-| Aurora 呼び出しを検索 | `annotation.app_peer = "aurora-mysql"` | Tags 欄に `app_peer=aurora-mysql` |
+| Aurora 呼び出しを検索 | `annotation.app_peer = "DataBase（Aurora_MySQL）"` | Tags 欄に `app_peer=DataBase（Aurora_MySQL）` |
 
 **検索の書き方だけが違い、名前と意味は完全に同じ**。
 ローカルで確認した内容がそのまま X-Ray に持ち込める。

@@ -56,6 +56,7 @@ ecs/                      タスク定義テンプレート
 scripts/                  build / up / down / smoke-trace / gen-taskdefs / drift check
 docs/
   naming-convention.md    ★ 命名規約と X-Ray での検索方法
+  xray-node-naming.md     ★ X-Ray のノード表示名の付け方 (追加実装の解説)
   xray-vs-jaeger.md       ★ Compose と X-Ray の差分・注意点
   trace-paths.md          ★ 6 経路それぞれの伝播の仕組み
 ```
@@ -93,11 +94,15 @@ Aurora / Valkey / 帳票 EC2 / 外部 SLB は計装できない。既定では�
 
 `otel-env.sh` が接続先ホストの環境変数から
 `OTEL_INSTRUMENTATION_COMMON_PEER_SERVICE_MAPPING` を組み立てるので、
-**アプリのコードを 1 行も触らずに** `aurora-mysql` / `elasticache-valkey` /
-`report-ec2` / `external-slb` という運用上の呼び名に揃う。
+**アプリのコードを 1 行も触らずに** `DataBase（Aurora_MySQL）` / `session_store（Valkey）` /
+`ec2_server` / `external-slb` という運用上の呼び名に揃う (docs/xray-node-naming.md)。
 
 アプリが接続に使うホスト名とマッピングのキーが同じ環境変数から来るため、
 両者がずれることが構造的に起きない。
+
+表示名は `otel-env.sh` の `PEER_NAME_*` に集約してあり、環境変数だけで変えられる。
+
+→ 詳細と変更手順: [`docs/xray-node-naming.md`](docs/xray-node-naming.md)
 
 ### 3. X-Ray で「検索できる」形にする
 
@@ -108,7 +113,7 @@ Collector の `transform/xray-annotations` がスパン属性へ写し、
 ```
 annotation.app_service = "sf-api"  AND annotation.app_role = "back"
 annotation.app_caller  = "batch-ec2"      # EC2 バッチ由来だけ
-annotation.app_peer    = "aurora-mysql"   # Aurora を呼んでいるスパンだけ
+annotation.app_peer    = "DataBase（Aurora_MySQL）"   # Aurora を呼んでいるスパンだけ
 ```
 
 同じ transform をローカルの Collector でも通しているので、

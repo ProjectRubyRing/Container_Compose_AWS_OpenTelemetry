@@ -25,10 +25,10 @@
 #  Tags 欄にも app_service / app_role / app_caller / app_peer が出る。
 #  Jaeger UI の検索窓に
 #      app_caller=batch-ec2
-#      app_peer=aurora-mysql
+#      app_peer=DataBase（Aurora_MySQL）
 #  と入れれば、X-Ray のフィルタ式
 #      annotation.app_caller = "batch-ec2"
-#      annotation.app_peer   = "aurora-mysql"
+#      annotation.app_peer   = "DataBase（Aurora_MySQL）"
 #  と同じ結果が得られる。検索のやり方だけが違い、意味は同じ。
 # =============================================================================
 
@@ -83,6 +83,23 @@ processors:
           - set(attributes["app_ns"],      resource.attributes["service.namespace"]) where resource.attributes["service.namespace"] != nil
           - set(attributes["ecs_service"], resource.attributes["aws.ecs.service.name"]) where resource.attributes["aws.ecs.service.name"] != nil
           - set(attributes["ecs_task_family"], resource.attributes["aws.ecs.task.family"]) where resource.attributes["aws.ecs.task.family"] != nil
+          # --- 下流ノードの表示名 (保険) ---
+          #     ★ 本来の担当はアプリ側 (base/bin/otel-env.sh の PEER_NAME_*)。
+          #       peer-service-mapping は「接続先ホスト名の完全一致」でしか
+          #       効かないため、次の場合に外れてノード名が FQDN に戻る:
+          #         - Aurora / ElastiCache がクラスタ構成で、クライアントが
+          #           設定エンドポイントではなく個別ノードの FQDN へ繋いだ
+          #         - DB_HOST / VALKEY_HOST の設定漏れ・綴り違い
+          #       外れると「マップにノードが数だけ増える」形で壊れるので、
+          #       db.system から種別を見て最後に名前を寄せる。
+          #     ★ peer.service が既に入っているスパンには触らない (== nil 条件)。
+          #     ★ 文字列は base/bin/otel-env.sh の PEER_NAME_AURORA /
+          #       PEER_NAME_VALKEY と同じ値にすること。2 つの Collector 設定が
+          #       一致していることは scripts/check-collector-drift.sh が検査する。
+          #     db.system     … semconv 1.20 まで (現行の Java Agent)
+          #     db.system.name… semconv 1.30 以降。将来の版で切り替わるので両対応
+          - set(attributes["peer.service"], "DataBase（Aurora_MySQL）") where attributes["peer.service"] == nil and (attributes["db.system"] == "mysql" or attributes["db.system.name"] == "mysql")
+          - set(attributes["peer.service"], "session_store（Valkey）") where attributes["peer.service"] == nil and (attributes["db.system"] == "redis" or attributes["db.system.name"] == "redis" or attributes["db.system"] == "valkey" or attributes["db.system.name"] == "valkey")
           - set(attributes["app_peer"], attributes["peer.service"]) where attributes["peer.service"] != nil
           - set(attributes["app_caller"], attributes["http.request.header.x-app-caller"]) where attributes["http.request.header.x-app-caller"] != nil
           - set(attributes["app_caller"], attributes["http.request.header.x_app_caller"]) where attributes["http.request.header.x_app_caller"] != nil

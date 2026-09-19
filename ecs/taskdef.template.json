@@ -90,6 +90,14 @@
         { "_comment": "--- トレース関連 WARN の抑制: resource|context|export|sampler|muzzle / all / off (export と sampler は既定で消さない) ---" },
         { "name": "OTEL_TRACE_WARN_SUPPRESS",   "value": "resource,context" },
 
+        { "_comment": "--- X-Ray サービスマップの下流ノード名 (docs/xray-node-naming.md) ---" },
+        { "_comment": "     既定値は base/bin/otel-env.sh (6-1 節) が持つので、ここには書かない。" },
+        { "_comment": "       DB_HOST -> DataBase（Aurora_MySQL） / VALKEY_HOST -> session_store（Valkey） / REPORT_ALB_HOST -> ec2_server" },
+        { "_comment": "     変えたいときだけ PEER_NAME_AURORA / PEER_NAME_VALKEY / PEER_NAME_EC2 / PEER_NAME_EXTERNAL_SLB / PEER_NAME_SQS を足す。" },
+        { "_comment": "--- APP_PEER_NAME_MODE: as-is=指定どおり送る / xray-safe=X-Ray が受け付けない文字 (括弧など) を _ に置換 / strict=あれば起動しない ---" },
+        { "_comment": "     X-Ray のセグメント名に丸括弧は使えない。マップにノードが出ない・括弧が落ちる場合は xray-safe にする (DataBase_Aurora_MySQL になる)。" },
+        { "name": "APP_PEER_NAME_MODE", "value": "as-is" },
+
         { "_comment": "--- back も同一タスク内 = localhost ---" },
         { "name": "BACKEND_HOST", "value": "localhost" },
         { "name": "BACKEND_URL",  "value": "http://localhost:18080" },
@@ -173,6 +181,14 @@
         { "name": "OTEL_WAIT_FOR_COLLECTOR",     "value": "true" },
         { "_comment": "--- トレース関連 WARN の抑制: resource|context|export|sampler|muzzle / all / off (export と sampler は既定で消さない) ---" },
         { "name": "OTEL_TRACE_WARN_SUPPRESS",   "value": "resource,context" },
+
+        { "_comment": "--- X-Ray サービスマップの下流ノード名 (docs/xray-node-naming.md) ---" },
+        { "_comment": "     既定値は base/bin/otel-env.sh (6-1 節) が持つので、ここには書かない。" },
+        { "_comment": "       DB_HOST -> DataBase（Aurora_MySQL） / VALKEY_HOST -> session_store（Valkey） / REPORT_ALB_HOST -> ec2_server" },
+        { "_comment": "     変えたいときだけ PEER_NAME_AURORA / PEER_NAME_VALKEY / PEER_NAME_EC2 / PEER_NAME_EXTERNAL_SLB / PEER_NAME_SQS を足す。" },
+        { "_comment": "--- APP_PEER_NAME_MODE: as-is=指定どおり送る / xray-safe=X-Ray が受け付けない文字 (括弧など) を _ に置換 / strict=あれば起動しない ---" },
+        { "_comment": "     X-Ray のセグメント名に丸括弧は使えない。マップにノードが出ない・括弧が落ちる場合は xray-safe にする (DataBase_Aurora_MySQL になる)。" },
+        { "name": "APP_PEER_NAME_MODE", "value": "as-is" },
 
         { "name": "DB_HOST", "value": "<aurora-cluster>.cluster-<id>.<region>.rds.amazonaws.com" },
         { "name": "DB_PORT", "value": "3306" },

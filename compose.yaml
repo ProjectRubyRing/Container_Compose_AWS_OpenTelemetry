@@ -76,6 +76,30 @@ x-app-common: &app-common
     APP_NAMESPACE: ${APP_NAMESPACE:-shopdemo}
     APP_VERSION: ${APP_VERSION:-1.0.0}
 
+    # --- X-Ray / Jaeger のノード表示名 (下流ノード) ---------------------------
+    #  ★ 既定値は base/bin/otel-env.sh (6-1 節) が持っている。ここは
+    #    「.env で上書きしたいときだけ効く」通り道なので、空のまま渡す。
+    #    値をここに書くと、既定値の置き場所が 2 か所になって必ずずれる。
+    #
+    #    既定:  DB_HOST         -> DataBase（Aurora_MySQL）
+    #           VALKEY_HOST     -> session_store（Valkey）
+    #           REPORT_ALB_HOST -> ec2_server
+    #
+    #    APP_PEER_NAME_MODE
+    #      as-is     (既定) 指定どおりの名前で送る。X-Ray が受け付けない文字が
+    #                あれば起動ログに WARN が出る
+    #      xray-safe X-Ray が受け付けない文字 (括弧など) を _ に置換して送る
+    #      strict    受け付けない文字があれば起動しない
+    #
+    #    詳細と、括弧付きの名前が X-Ray でどう扱われるかは
+    #    docs/xray-node-naming.md を参照。
+    PEER_NAME_AURORA: ${PEER_NAME_AURORA:-}
+    PEER_NAME_VALKEY: ${PEER_NAME_VALKEY:-}
+    PEER_NAME_EC2: ${PEER_NAME_EC2:-}
+    PEER_NAME_EXTERNAL_SLB: ${PEER_NAME_EXTERNAL_SLB:-}
+    PEER_NAME_SQS: ${PEER_NAME_SQS:-}
+    APP_PEER_NAME_MODE: ${APP_PEER_NAME_MODE:-as-is}
+
     # --- ADOT の関数レベル計装 (AWS Service Events) --------------------------
     #  空 = 使わない。otel-env.sh が
     #    OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED=false

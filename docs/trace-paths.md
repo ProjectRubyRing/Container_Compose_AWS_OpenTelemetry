@@ -55,7 +55,7 @@ awsvpc モードではタスク内の全コンテナが 1 つのネットワー�
 | 伝播 | 無し (DB は計装対象外なのでここでトレースは終端) |
 | 設定 | `DB_HOST`, `20-datasource-aurora.cli`, `OTEL_INSTRUMENTATION_JDBC_DATASOURCE_ENABLED=true` |
 
-**X-Ray での見え方**: `aurora-mysql` という下流ノード (`peer.service` 由来)。
+**X-Ray での見え方**: `DataBase（Aurora_MySQL）` という下流ノード (`peer.service` 由来)。
 `Database::SQL` 種別のサブセグメント。
 
 **Aurora Serverless v2 固有の注意**:
@@ -77,7 +77,7 @@ SQL のリテラルは `db-statement-sanitizer` が `?` に伏せるため、
 | 伝播 | 無し (終端) |
 | 設定 | `VALKEY_HOST`, `VALKEY_PORT` |
 
-**X-Ray での見え方**: `elasticache-valkey` という下流ノード。
+**X-Ray での見え方**: `session_store（Valkey）` という下流ノード。
 
 **★ クライアントライブラリの選択が重要**:
 Valkey は Redis プロトコル互換なので、**Jedis または Lettuce** で接続する。
@@ -96,7 +96,7 @@ X-Ray からキャッシュアクセスが丸ごと消える。
 | 伝播 | `traceparent` + `X-Amzn-Trace-Id` を送出。ALB は両方素通し |
 | 設定 | `REPORT_ALB_HOST`, `REPORT_ALB_URL` |
 
-**X-Ray での見え方**: `report-ec2` という下流ノード。
+**X-Ray での見え方**: `ec2_server` という下流ノード。
 帳票 EC2 が計装されていないので、**そのノードの内側は見えない**
 (帳票生成に何秒かかったかは分かるが、その内訳は分からない)。
 
@@ -106,7 +106,7 @@ X-Ray からキャッシュアクセスが丸ごと消える。
 コンテナ側と揃えれば 1 本のトレースとして繋がる。
 
 ```sh
-export OTEL_SERVICE_NAME=report-ec2
+export OTEL_SERVICE_NAME=ec2_server   # ★ peer.service 側と同じ名前に揃える
 export OTEL_PROPAGATORS=xray,tracecontext,baggage   # ★ 必ず揃える
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 java -javaagent:/opt/aws/aws-opentelemetry-agent.jar -jar report.jar

@@ -240,7 +240,154 @@ fi
 #
 #    ここでは「接続先ホスト名を持つ環境変数」から自動生成する。ホスト名は
 #    Compose と ECS で当然変わるが、この導出ロジックは変わらない。
+#
+#    ---------------------------------------------------------------------------
+#    ★ 表示名は 6-1 の PEER_NAME_* に集約してある
+#      (詳細と変更手順: docs/xray-node-naming.md)
+#    ---------------------------------------------------------------------------
+#    「X-Ray のこのノードの名前を変えたい」と思ったときに探す場所が 1 か所で
+#    済むよう、論理名をリテラルで埋め込まず変数にしてある。値はすべて
+#    環境変数 (compose / タスク定義) から上書きできる。
 # -----------------------------------------------------------------------------
+
+# --- 6-1. ノードの表示名 ------------------------------------------------------
+#
+#   ここに書いた文字列が、そのまま X-Ray サービスマップのノード名になる。
+#   (Jaeger では Tags の app_peer に同じ値が出る)
+#
+#     PEER_NAME_AURORA        Aurora Serverless v2 (MySQL 8.4)  <- DB_HOST
+#     PEER_NAME_VALKEY        ElastiCache for Valkey            <- VALKEY_HOST
+#     PEER_NAME_EC2           帳票 EC2 サーバ (ALB 経由)        <- REPORT_ALB_HOST
+#     PEER_NAME_EXTERNAL_SLB  外部 SLB (VPC 外)                 <- EXTERNAL_SLB_HOST
+#     PEER_NAME_SQS           Amazon SQS                        <- SQS_HOST
+#     PEER_NAME_BACKEND       同一タスク内の back               <- BACKEND_HOST
+#
+#   ★ EC2 が 2 種類あることに注意 (docs/trace-paths.md)。
+#     ここで名前を付けられるのは「こちらから呼びに行く」帳票 EC2 だけ。
+#     こちらを呼んでくる EC2 バッチは、計装しない限りマップにノードが出ない
+#     (計装されていない発信元の存在を X-Ray は知りようがない)。
+#     そちらは annotation.app_caller = "batch-ec2" で辿る。
+: "${PEER_NAME_AURORA:=DataBase（Aurora_MySQL）}"
+: "${PEER_NAME_VALKEY:=session_store（Valkey）}"
+: "${PEER_NAME_EC2:=ec2_server}"
+: "${PEER_NAME_EXTERNAL_SLB:=external-slb}"
+: "${PEER_NAME_SQS:=sqs}"
+: "${PEER_NAME_BACKEND:=${APP_SERVICE}-back}"
+
+# --- 6-2. 表示名の検査 --------------------------------------------------------
+#
+#   ★ この検査を入れた理由 (無いと静かに壊れる 2 種類の文字がある)
+#
+#   (a) 対応表そのものを壊す文字  ->  起動を止める
+#       peer-service-mapping は "," で要素を、"=" でキーと値を区切る。
+#       名前にこの 2 文字が入ると対応表の解析がずれ、そこから後ろの
+#       マッピングが丸ごと無効になる。「Aurora だけ名前が変わらない」
+#       ではなく「全部 FQDN に戻る」形で出るので原因が非常に追いにくい。
+#
+#   (b) X-Ray が受け付けない文字  ->  警告 / 置換 / 停止 を選べる
+#       X-Ray のセグメント名に使えるのは
+#           Unicode の文字 / 数字 / 空白 と  _ . : / % & # = + \ - @
+#       だけで、丸括弧 ( ) （ ） は含まれない。
+#       (日本語の文字は「Unicode の文字」なので使える)
+#
+#       既定値の DataBase（Aurora_MySQL） / session_store（Valkey） は
+#       この規則から外れている。実際の挙動は ADOT Collector の版で変わり、
+#         - awsxray exporter が不正文字を落として送る
+#           -> ノード名が DataBaseAurora_MySQL のように括弧だけ消える
+#         - そのまま送られて X-Ray 側が受理しない
+#           -> そのサブセグメントが捨てられ、ノードが出ない
+#       のどちらかになる。どちらに転んでも「狙った表示にならない」ため、
+#       起動ログで必ず警告し、X-Ray が受け付ける代替名を併記する。
+#
+#   APP_PEER_NAME_MODE で扱いを選ぶ:
+#     as-is     (既定) 指定どおりの名前で送る。警告だけ出す。
+#                      -> まず実際の見え方を確認したいとき。
+#                         Jaeger (ローカル) は括弧付きでもそのまま表示される
+#     xray-safe        使えない文字を "_" に置換して送る。
+#                      -> DataBase_Aurora_MySQL / session_store_Valkey になる。
+#                         本番で確実にノードを出したいときはこちら
+#     strict           使えない文字があれば起動を止める。
+#                      -> 命名を規約で縛りたいとき
+: "${APP_PEER_NAME_MODE:=as-is}"
+case "${APP_PEER_NAME_MODE}" in
+    as-is|xray-safe|strict) ;;
+    *) otel_die "APP_PEER_NAME_MODE が規約外です: [${APP_PEER_NAME_MODE}] / 許可値: as-is, xray-safe, strict" 45 ;;
+esac
+
+#  X-Ray のセグメント名として安全か (安全なら 0 を返す)。
+#
+#  ★ 「使える文字」ではなく「使えない文字」を列挙する方式にしてある。
+#    [[:alnum:]] のような文字クラスで判定すると、ロケールが C のコンテナでは
+#    日本語がすべて「不正」に化ける。X-Ray は Unicode の文字を許可しているので
+#    それでは誤検知になる (帳票EC2 のような名前を弾いてしまう)。
+otel_peer_name_is_xray_safe() {
+    case "$1" in
+        *"（"*|*"）"*|*"("*|*")"*|*"["*|*"]"*|*"{"*|*"}"*)   return 1 ;;
+        *'"'*|*"'"*|*'`'*|*'!'*|*'?'*|*'*'*)                 return 1 ;;
+        *'<'*|*'>'*|*'|'*|*'^'*|*'~'*|*'$'*|*';'*|*','*)     return 1 ;;
+        *"、"*|*"。"*|*"　"*)                                 return 1 ;;
+    esac
+    return 0
+}
+
+#  使えない文字を "_" に寄せた名前を返す (連続した _ は 1 つに畳み、前後は落とす)。
+otel_peer_name_to_xray_safe() {
+    printf '%s' "$1" \
+      | sed -e 's/（/_/g' -e 's/）/_/g' -e 's/、/_/g' -e 's/。/_/g' -e 's/　/_/g' \
+      | tr '()[]{}<>|^~$;,!?*"'"'"'\140' '____________________' \
+      | sed -e 's/__*/_/g' -e 's/^_//' -e 's/_$//'
+}
+
+#  1 件ぶんの検査。採用した名前は _peer_name_out に入れて返す。
+#
+#  ★ $( ) で受け取らない理由: $( ) はサブシェルなので、その中で otel_die が
+#    exit してもサブシェルが終わるだけで本体は走り続ける。「規約違反なら
+#    起動させない」という本スクリプトの前提がまるごと効かなくなる。
+_peer_name_unsafe=""     # as-is のまま通した不正名の一覧 (起動ログ用)
+otel_peer_name_check() {
+    # $1 = 変数名 (メッセージ用) / $2 = 値
+    _pn_name="$1"
+    _pn_val="$2"
+
+    [ -n "${_pn_val}" ] || otel_die "${_pn_name} が空です。X-Ray のノード名になる値なので、空のままでは起動させません。" 45
+
+    # (a) 対応表を壊す文字
+    case "${_pn_val}" in
+        *,*) otel_die "${_pn_name} に , が含まれています: [${_pn_val}] / peer-service-mapping の要素区切り文字なので、対応表が壊れて以降のマッピングが全部無効になります (ノード名が全部 FQDN に戻ります)。" 45 ;;
+        *=*) otel_die "${_pn_name} に = が含まれています: [${_pn_val}] / peer-service-mapping のキーと値の区切り文字なので、対応表が壊れます。" 45 ;;
+    esac
+
+    # (b) X-Ray が受け付けない文字
+    if otel_peer_name_is_xray_safe "${_pn_val}"; then
+        _peer_name_out="${_pn_val}"
+        return 0
+    fi
+    _pn_safe="$(otel_peer_name_to_xray_safe "${_pn_val}")"
+    case "${APP_PEER_NAME_MODE}" in
+        xray-safe)
+            otel_warn "${_pn_name}: X-Ray のセグメント名に使えない文字があるため置換しました [${_pn_val}] -> [${_pn_safe}] (APP_PEER_NAME_MODE=xray-safe)"
+            _peer_name_out="${_pn_safe}"
+            ;;
+        strict)
+            otel_die "${_pn_name} に X-Ray のセグメント名で使えない文字があります: [${_pn_val}] / 使えるのは Unicode の文字・数字・空白と _ . : / % & # = + \\ - @ だけです。代替候補: [${_pn_safe}] (APP_PEER_NAME_MODE=strict)" 46
+            ;;
+        *)
+            otel_warn "${_pn_name}: X-Ray のセグメント名に使えない文字が含まれています [${_pn_val}]。X-Ray 上では [${_pn_safe}] のように文字が落ちるか、ノード自体が出ない可能性があります。確実にノードを出したい場合は APP_PEER_NAME_MODE=xray-safe を指定してください (ローカルの Jaeger はこのままでも表示されます)。"
+            _peer_name_unsafe="${_peer_name_unsafe}${_peer_name_unsafe:+, }${_pn_name}"
+            _peer_name_out="${_pn_val}"
+            ;;
+    esac
+}
+
+for _pn in PEER_NAME_AURORA PEER_NAME_VALKEY PEER_NAME_EC2 \
+           PEER_NAME_EXTERNAL_SLB PEER_NAME_SQS PEER_NAME_BACKEND; do
+    eval "_pv=\${${_pn}}"
+    otel_peer_name_check "${_pn}" "${_pv}"
+    eval "${_pn}=\${_peer_name_out}"
+done
+unset _pn _pv _pn_name _pn_val _pn_safe _peer_name_out
+
+# --- 6-3. 接続先ホスト -> 表示名 の対応表を組み立てる -------------------------
 otel_peer_add() {
     # $1 = ホスト (空なら何もしない) / $2 = 論理名
     [ -n "${1:-}" ] || return 0
@@ -248,11 +395,11 @@ otel_peer_add() {
 }
 
 _peer=""
-otel_peer_add "${DB_HOST:-}"           "aurora-mysql"
-otel_peer_add "${VALKEY_HOST:-}"       "elasticache-valkey"
-otel_peer_add "${REPORT_ALB_HOST:-}"   "report-ec2"
-otel_peer_add "${EXTERNAL_SLB_HOST:-}" "external-slb"
-otel_peer_add "${SQS_HOST:-}"          "sqs"
+otel_peer_add "${DB_HOST:-}"           "${PEER_NAME_AURORA}"
+otel_peer_add "${VALKEY_HOST:-}"       "${PEER_NAME_VALKEY}"
+otel_peer_add "${REPORT_ALB_HOST:-}"   "${PEER_NAME_EC2}"
+otel_peer_add "${EXTERNAL_SLB_HOST:-}" "${PEER_NAME_EXTERNAL_SLB}"
+otel_peer_add "${SQS_HOST:-}"          "${PEER_NAME_SQS}"
 
 # back へのマッピングは front のときだけ入れる。
 #
@@ -264,7 +411,7 @@ otel_peer_add "${SQS_HOST:-}"          "sqs"
 #   将来 localhost の別ポートを呼ぶ相手が増えたら、この方式では区別できない。
 #   その場合は接続先を FQDN にするか、アプリ側で peer.service を明示する。
 if [ "${APP_ROLE}" = "front" ]; then
-    otel_peer_add "${BACKEND_HOST:-}" "${APP_SERVICE}-back"
+    otel_peer_add "${BACKEND_HOST:-}" "${PEER_NAME_BACKEND}"
 fi
 
 # 連携先が増えたときに外から足すためのフック
@@ -658,6 +805,18 @@ otel_print_summary() {
     otel_log "  OTEL_TRACES_EXPORTER             = ${OTEL_TRACES_EXPORTER}"
     otel_log "  OTEL_PROPAGATORS                 = ${OTEL_PROPAGATORS}"
     otel_log "  OTEL_TRACES_SAMPLER              = ${OTEL_TRACES_SAMPLER} ${OTEL_TRACES_SAMPLER_ARG:-}"
+    otel_log "  ノード表示名モード               = ${APP_PEER_NAME_MODE}"
+    otel_log "  X-Ray サービスマップの下流ノード名"
+    otel_log "      DB_HOST           -> ${PEER_NAME_AURORA}"
+    otel_log "      VALKEY_HOST       -> ${PEER_NAME_VALKEY}"
+    otel_log "      REPORT_ALB_HOST   -> ${PEER_NAME_EC2}"
+    otel_log "      EXTERNAL_SLB_HOST -> ${PEER_NAME_EXTERNAL_SLB}"
+    otel_log "      SQS_HOST          -> ${PEER_NAME_SQS}"
+    otel_log "      BACKEND_HOST      -> ${PEER_NAME_BACKEND} (front のみ)"
+    if [ -n "${_peer_name_unsafe}" ]; then
+        otel_log "      ★ X-Ray が受け付けない文字を含んだまま送信: ${_peer_name_unsafe}"
+        otel_log "        (X-Ray でノードが出ない / 文字が落ちる場合は APP_PEER_NAME_MODE=xray-safe)"
+    fi
     otel_log "  peer-service-mapping             = ${OTEL_INSTRUMENTATION_COMMON_PEER_SERVICE_MAPPING:-(なし)}"
     otel_log "  service-events (function 計装)   = ${OTEL_AWS_SERVICE_EVENTS_FUNCTION_INSTRUMENT_ENABLED} packages=${OTEL_AWS_SERVICE_EVENT_PACKAGES_INCLUDE:-(なし)}"
     otel_log "  db query sanitization            = ${OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED}"
