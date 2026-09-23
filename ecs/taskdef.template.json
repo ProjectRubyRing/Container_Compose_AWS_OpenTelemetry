@@ -116,6 +116,8 @@
         { "_comment": "--- 帳票 EC2 (内部 ALB 経由) ---" },
         { "name": "REPORT_ALB_HOST", "value": "<report-alb>.<region>.elb.amazonaws.com" },
         { "name": "REPORT_ALB_URL",  "value": "https://<report-alb>.<region>.elb.amazonaws.com/report/daily" },
+        { "_comment": "     both = ノード名を <PEER_NAME_EC2>@<PEER_NAME_ALB> (既定 ec2_server@report-alb) にし、ALB の裏の EC2 だとノード名で分かるようにする (docs/alb-trace-map-fix.md)" },
+        { "name": "APP_PEER_ALB_MODE", "value": "both" },
 
         { "_comment": "--- 外部 SLB (VPC 外) ---" },
         { "name": "EXTERNAL_SLB_HOST", "value": "<external-slb-fqdn>" },

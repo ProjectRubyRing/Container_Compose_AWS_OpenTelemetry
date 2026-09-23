@@ -296,6 +296,22 @@ processors:
           - set(attributes["app_upstream"], attributes["http.response.header.x-backend-server"]) where attributes["app_upstream"] == nil and attributes["http.response.header.x-backend-server"] != nil
           - set(attributes["app_upstream"], attributes["app_upstream"][0]) where IsList(attributes["app_upstream"])
 
+          # --- 呼び出し元ノードの補完 (親の無い CLIENT / PRODUCER / INTERNAL) ---
+          #     ★ 「Client から ALB/EC2 のノードへ直接線が引かれ、front が
+          #       途中に出てこない」形の原因 (docs/alb-trace-map-fix.md)。
+          #       awsxray exporter は親の無い CLIENT スパンを、peer.service を
+          #       名前にした「セグメント」へ変換する。X-Ray はそれを入口の
+          #       サービスとみなし、上流に Client ノードを付ける。
+          #       (スケジューラ・非同期スレッド・起動時処理など、サーバスパンの
+          #        外で下流を呼んだときに起きる)
+          #       aws.span.kind=LOCAL_ROOT と aws.local.service を付けると、
+          #       exporter が「自サービス (service.name) のセグメント」+
+          #       「下流のサブセグメント」に分けて出すので、線が front から引かれる。
+          #     kind: 1=INTERNAL / 3=CLIENT / 4=PRODUCER。
+          #     Application Signals が既に aws.span.kind を付けている場合は触らない。
+          - set(attributes["aws.local.service"], resource.attributes["service.name"]) where (kind == 1 or kind == 3 or kind == 4) and parent_span_id == SpanID(0x0000000000000000) and attributes["aws.span.kind"] == nil and resource.attributes["service.name"] != nil
+          - set(attributes["aws.span.kind"], "LOCAL_ROOT") where (kind == 1 or kind == 3 or kind == 4) and parent_span_id == SpanID(0x0000000000000000) and attributes["aws.span.kind"] == nil and attributes["aws.local.service"] != nil
+
   # ---------------------------------------------------------------------------
   # 3. X-Ray の annotation 用にリソース属性をスパンへ写す
   #

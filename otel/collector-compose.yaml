@@ -263,6 +263,16 @@ processors:
           - set(attributes["app_upstream"], attributes["http.response.header.x-backend-server"]) where attributes["app_upstream"] == nil and attributes["http.response.header.x-backend-server"] != nil
           - set(attributes["app_upstream"], attributes["app_upstream"][0]) where IsList(attributes["app_upstream"])
 
+          # --- 呼び出し元ノードの補完 (親の無い CLIENT / PRODUCER / INTERNAL) ---
+          #     ★ X-Ray で「Client から ALB/EC2 のノードへ直接線が引かれる」形を
+          #       直すための印 (docs/alb-trace-map-fix.md)。効くのは awsxray
+          #       exporter だけで、Jaeger の表示は変わらない。ここでは
+          #       Tags に aws.span.kind=LOCAL_ROOT が付くことで、X-Ray で
+          #       分割される対象のスパンをローカルで先に確認できる。
+          #     X-Ray 版と同一に保つこと (scripts/check-collector-drift.sh)。
+          - set(attributes["aws.local.service"], resource.attributes["service.name"]) where (kind == 1 or kind == 3 or kind == 4) and parent_span_id == SpanID(0x0000000000000000) and attributes["aws.span.kind"] == nil and resource.attributes["service.name"] != nil
+          - set(attributes["aws.span.kind"], "LOCAL_ROOT") where (kind == 1 or kind == 3 or kind == 4) and parent_span_id == SpanID(0x0000000000000000) and attributes["aws.span.kind"] == nil and attributes["aws.local.service"] != nil
+
   transform/xray-annotations:
     error_mode: ignore
     trace_statements:

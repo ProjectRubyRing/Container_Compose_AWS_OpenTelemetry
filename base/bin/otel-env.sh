@@ -279,6 +279,12 @@ fi
 #                     例: REPORT_ALB_HOST -> PEER_NAME_ALB (既定 report-alb)
 #                     マップは front -> report-alb で止まる。
 #                     「どの ALB で詰まっているか」を見たいときはこちら。
+#     both            ALB と裏の EC2 の両方をノード名に入れる。
+#                     例: REPORT_ALB_HOST -> <PEER_NAME_EC2>@<PEER_NAME_ALB>
+#                         (既定 ec2_server@report-alb)
+#                     マップは front -> ec2_server@report-alb の 1 エッジになり、
+#                     「report-alb の裏の ec2_server」とノード名だけで読める。
+#                     (docs/alb-trace-map-fix.md)
 #
 #   ★ ALB は X-Ray にセグメントを送らない (API Gateway と違い、ALB 自身の
 #     ノードは AWS 側からは作られない)。上のどちらを選んでも、マップに出る
@@ -293,8 +299,8 @@ fi
 # -----------------------------------------------------------------------------
 : "${APP_PEER_ALB_MODE:=upstream}"
 case "${APP_PEER_ALB_MODE}" in
-    upstream|alb) ;;
-    *) otel_die "APP_PEER_ALB_MODE の値が不正です: [${APP_PEER_ALB_MODE}] / upstream または alb を指定してください。" 45 ;;
+    upstream|alb|both) ;;
+    *) otel_die "APP_PEER_ALB_MODE の値が不正です: [${APP_PEER_ALB_MODE}] / upstream / alb / both のいずれかを指定してください。" 45 ;;
 esac
 
 # --- 6-1. 段1 の表示名 — ★ ノード名を変えたくなったら触るのはここだけ --------
@@ -306,6 +312,7 @@ esac
 #     PEER_NAME_VALKEY        ElastiCache for Valkey            <- VALKEY_HOST
 #     PEER_NAME_EC2           帳票 EC2 サーバ (ALB 経由)        <- REPORT_ALB_HOST
 #     PEER_NAME_ALB           同上 / APP_PEER_ALB_MODE=alb のとき使う名前
+#                             (both のときは <PEER_NAME_EC2>@<PEER_NAME_ALB>)
 #     PEER_NAME_EXTERNAL_SLB  外部 SLB (VPC 外)                 <- EXTERNAL_SLB_HOST
 #     PEER_NAME_SQS           Amazon SQS                        <- SQS_HOST
 #     PEER_NAME_BACKEND       同一タスク内の back               <- BACKEND_HOST
@@ -640,8 +647,14 @@ otel_peer_emit() {
 #     こちらは AWS の ALB ではなく相手側のロードバランサーで、その裏に
 #     何が居るかは分からない。透過扱いにしようがないので常に
 #     PEER_NAME_EXTERNAL_SLB のノードで止まる。
+#   ★ both の区切りに @ を使う理由
+#     X-Ray のセグメント名に使える記号で、awsxray exporter 自身も DB を
+#     <db名>@<ホスト> と名付ける (= X-Ray で見慣れた「A@B = B の上の A」の形)。
+#     末尾が PEER_NAME_ALB (既定 report-alb) になるので、Collector の
+#     app_via 判定 (peer.service が -alb で終わる) もそのまま効く。
 _alb_role_name="${PEER_NAME_EC2}"
 [ "${APP_PEER_ALB_MODE}" = "alb" ] && _alb_role_name="${PEER_NAME_ALB}"
+[ "${APP_PEER_ALB_MODE}" = "both" ] && _alb_role_name="${PEER_NAME_EC2}@${PEER_NAME_ALB}"
 
 otel_peer_targets() {
     cat <<TARGETS
@@ -1306,7 +1319,7 @@ otel_print_summary() {
     otel_log "  段1 の表示名 (PEER_NAME_*) — 段2/段3 の既定ルールも同じ名前を返す"
     otel_log "      DB_HOST           -> ${PEER_NAME_AURORA}"
     otel_log "      VALKEY_HOST       -> ${PEER_NAME_VALKEY}"
-    otel_log "      REPORT_ALB_HOST   -> ${PEER_NAME_EC2} / ${PEER_NAME_ALB} (ALB モード=alb のとき)"
+    otel_log "      REPORT_ALB_HOST   -> ${PEER_NAME_EC2} / ${PEER_NAME_ALB} (ALB モード=alb のとき) / ${PEER_NAME_EC2}@${PEER_NAME_ALB} (both のとき)"
     otel_log "      EXTERNAL_SLB_HOST -> ${PEER_NAME_EXTERNAL_SLB}"
     otel_log "      SQS_HOST          -> ${PEER_NAME_SQS}"
     otel_log "      BACKEND_HOST      -> ${PEER_NAME_BACKEND} (front のみ)"
